@@ -1207,7 +1207,7 @@ def my_parse_args():
     parser.add_argument('--modelname', default="GPT2_6_act_nt")
     parser.add_argument('--config-dataloader', default='configs/config-dataloader.yml')
     parser.add_argument('--config-train', default='configs/config-train.yml')
-    parser.add_argument('--batch_size', default=1024,type=int)
+    parser.add_argument('--batch_size', default=8,type=int)
     parser.add_argument('--seed', type=int, default=42)
 
     # Data
