@@ -19,6 +19,6 @@ T5_disablepos_3_nt:
   lr: 1e-4
   warm_up: 5
 GPT2_6_act_nt:
-  nepoch: 50
+  nepoch: 25
   lr: 5e-5
   warm_up: 5
