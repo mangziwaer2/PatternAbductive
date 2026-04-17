@@ -235,5 +235,6 @@ sampled_data*/
 results/
 ckpt/
 metadata/kg_cache/
+dataset_cache/
 
 *.pdf

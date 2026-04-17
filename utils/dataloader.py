@@ -1,8 +1,8 @@
-import pandas as pd
-from datasets import Dataset
+import json
+
 from torch.utils.data import DataLoader
 
-from utils.load import load_sampled_dataset
+from utils.load import load_sampled_dataset, load_sampled_dataset_stats, load_saved_processed_dataset
 from utils.parsing import ans_shift_indices, list_to_str, qry_shift_indices, qry_str_2_actionstr
 from utils.textualization import observation_to_text, query_wordlist_to_text, query_wordlist_to_graph_text
 
@@ -11,7 +11,7 @@ REPRESENTATION_ID = 'id'
 REPRESENTATION_TEXT = 'text'
 
 
-def new_create_dataloader(dataset_dict, batch_size:int, drop_last:bool=False, shuffle:bool=True) :
+def new_create_dataloader(dataset_dict, batch_size: int, drop_last: bool = False, shuffle: bool = True):
     import warnings
     if drop_last:
         warnings.warn('drop_last is True')
@@ -27,84 +27,114 @@ def new_create_dataloader(dataset_dict, batch_size:int, drop_last:bool=False, sh
     return dataloader_dict
 
 
-def prepare_id_source_target(df: pd.DataFrame):
-    source = df['answers'].apply(ans_shift_indices)
-    source = source.apply(list_to_str)
-    target = df['query'].apply(qry_shift_indices)
-    target = target.apply(list_to_str)
-    target = target.apply(qry_str_2_actionstr)
+def _normalize_value(value, default):
+    if value is None:
+        return default
+    try:
+        if value != value:
+            return default
+    except Exception:
+        pass
+    return value
+
+
+def _get_batch_size(batch):
+    if not batch:
+        return 0
+    first_key = next(iter(batch))
+    return len(batch[first_key])
+
+
+def _get_column_or_default(batch, name, default):
+    batch_size = _get_batch_size(batch)
+    if name not in batch:
+        return [default] * batch_size
+    return [_normalize_value(value, default) for value in batch[name]]
+
+
+def _select_dataset_rows(dataset, max_rows):
+    if max_rows is None or max_rows <= 0:
+        return dataset
+    nrows = min(len(dataset), max_rows)
+    return dataset.select(range(nrows))
+
+
+def _decode_query_value(query):
+    if isinstance(query, str):
+        query = query.strip()
+        if query.startswith('[') and query.endswith(']'):
+            return json.loads(query)
+    return query
+
+
+def prepare_id_source_target_batch(batch):
+    source = [list_to_str(ans_shift_indices(answers)) for answers in batch['answers']]
+    target = [qry_str_2_actionstr(list_to_str(qry_shift_indices(_decode_query_value(query)))) for query in batch['query']]
     return source, target
 
 
-def prepare_text_source_target(
-        df: pd.DataFrame,
+def prepare_text_source_target_batch(
+        batch,
         kg=None,
         source_text_field: str = 'observation_text',
         target_text_field: str = 'hypothesis_text'):
-    def build_text_series(field_name: str):
-        if field_name in df:
-            return df[field_name].astype(str)
+    def build_text_column(field_name: str):
+        if field_name in batch:
+            return [str(value) for value in batch[field_name]]
         if kg is None:
             raise KeyError(f'Missing required text field "{field_name}" and kg is not provided for fallback conversion.')
         if field_name == 'observation_text':
-            return df['answers'].apply(lambda answers: observation_to_text(answers, kg))
+            return [observation_to_text(answers, kg) for answers in batch['answers']]
         if field_name == 'hypothesis_text':
-            return df['query'].apply(lambda query: query_wordlist_to_text(query, kg))
+            return [query_wordlist_to_text(_decode_query_value(query), kg) for query in batch['query']]
         if field_name == 'hypothesis_graph_text':
-            return df['query'].apply(lambda query: query_wordlist_to_graph_text(query, kg))
+            return [query_wordlist_to_graph_text(_decode_query_value(query), kg) for query in batch['query']]
         raise KeyError(f'Unsupported fallback text field: {field_name}')
 
-    source = build_text_series(source_text_field)
-    target = build_text_series(target_text_field)
+    source = build_text_column(source_text_field)
+    target = build_text_column(target_text_field)
     return source, target
 
 
-def pre_processing(
-        data: dict,
+def preprocess_batch(
+        batch,
         pattern_str_2_id: dict,
         kg=None,
         representation: str = REPRESENTATION_ID,
         source_text_field: str = 'observation_text',
         target_text_field: str = 'hypothesis_text'):
-    df = pd.DataFrame.from_records(data)
     if representation == REPRESENTATION_TEXT:
-        source, target = prepare_text_source_target(
-            df,
+        source, target = prepare_text_source_target_batch(
+            batch,
             kg=kg,
             source_text_field=source_text_field,
             target_text_field=target_text_field,
         )
     else:
-        source, target = prepare_id_source_target(df)
-    pattern_id = df['pattern_str'].apply(lambda x: pattern_str_2_id[x])
-    nrows = len(df)
+        source, target = prepare_id_source_target_batch(batch)
 
-    def get_column_or_default(name, default):
-        if name in df:
-            return df[name].apply(lambda value: default if pd.isna(value) else value)
-        return pd.Series([default] * nrows)
-
-    return pd.concat({
+    return {
         'source': source,
         'target': target,
-        'pattern_id': pattern_id,
-        'condition_text': get_column_or_default('condition_text', ''),
-        'condition_text_textual': get_column_or_default('condition_text_textual', ''),
-        'condition_signature': get_column_or_default('condition_signature', 'unconditional'),
-        'condition_size': get_column_or_default('condition_size', 0),
-        'condition_pattern': get_column_or_default('condition_pattern', ''),
-        'condition_entity_number': get_column_or_default('condition_entity_number', -1),
-        'condition_relation_number': get_column_or_default('condition_relation_number', -1),
-        'condition_specific_entity': get_column_or_default('condition_specific_entity', -1),
-        'condition_specific_relation': get_column_or_default('condition_specific_relation', 0),
-        'query_entity_number': get_column_or_default('query_entity_number', -1),
-        'query_relation_number': get_column_or_default('query_relation_number', -1),
-        'query_unique_entity_number': get_column_or_default('query_unique_entity_number', -1),
-        'query_unique_relation_number': get_column_or_default('query_unique_relation_number', -1),
-        'observation_text': get_column_or_default('observation_text', ''),
-        'hypothesis_text': get_column_or_default('hypothesis_text', ''),
-        'hypothesis_graph_text': get_column_or_default('hypothesis_graph_text', ''),
-    }, axis=1)
+        'pattern_id': [pattern_str_2_id[pattern_str] for pattern_str in batch['pattern_str']],
+        'condition_text': _get_column_or_default(batch, 'condition_text', ''),
+        'condition_text_textual': _get_column_or_default(batch, 'condition_text_textual', ''),
+        'condition_signature': _get_column_or_default(batch, 'condition_signature', 'unconditional'),
+        'condition_size': _get_column_or_default(batch, 'condition_size', 0),
+        'condition_pattern': _get_column_or_default(batch, 'condition_pattern', ''),
+        'condition_entity_number': _get_column_or_default(batch, 'condition_entity_number', -1),
+        'condition_relation_number': _get_column_or_default(batch, 'condition_relation_number', -1),
+        'condition_specific_entity': _get_column_or_default(batch, 'condition_specific_entity', -1),
+        'condition_specific_relation': _get_column_or_default(batch, 'condition_specific_relation', 0),
+        'query_entity_number': _get_column_or_default(batch, 'query_entity_number', -1),
+        'query_relation_number': _get_column_or_default(batch, 'query_relation_number', -1),
+        'query_unique_entity_number': _get_column_or_default(batch, 'query_unique_entity_number', -1),
+        'query_unique_relation_number': _get_column_or_default(batch, 'query_unique_relation_number', -1),
+        'observation_text': _get_column_or_default(batch, 'observation_text', ''),
+        'hypothesis_text': _get_column_or_default(batch, 'hypothesis_text', ''),
+        'hypothesis_graph_text': _get_column_or_default(batch, 'hypothesis_graph_text', ''),
+    }
+
 
 def new_create_dataset(dataname,
         pattern_filtered,
@@ -115,26 +145,71 @@ def new_create_dataset(dataname,
         source_text_field: str = 'observation_text',
         target_text_field: str = 'hypothesis_text',
         representation: str = REPRESENTATION_ID,
-        ):
+        dataset_cache_root: str = None,
+        dataset_num_proc: int = 1,
+        dataset_map_batch_size: int = 1000,
+        prefer_saved_processed_cache: bool = True):
 
     pattern_str_2_id = dict(zip(pattern_filtered['pattern_str'], pattern_filtered.index))
-
-    data_dict, nentity, nrelation = load_sampled_dataset(
-        data_root=data_root,
-        dataname=dataname,
-        splits=splits,
-        max_rows_by_split=max_rows_by_split,
-    )
+    nentity, nrelation = load_sampled_dataset_stats(data_root=data_root, dataname=dataname)
 
     dataset_dict = {}
+    splits_to_process = []
     for split in splits:
-        df = pre_processing(
-            data=data_dict[split],
-            pattern_str_2_id=pattern_str_2_id,
-            kg=kg,
-            source_text_field=source_text_field,
-            target_text_field=target_text_field,
-            representation=representation)
-        dataset_dict[split] = Dataset.from_pandas(df, split=split, preserve_index=False)
+        cached_dataset = None
+        if prefer_saved_processed_cache:
+            cached_dataset = load_saved_processed_dataset(
+                dataname=dataname,
+                split=split,
+                representation=representation,
+                source_text_field=source_text_field,
+                target_text_field=target_text_field,
+                dataset_cache_root=dataset_cache_root,
+            )
+        if cached_dataset is None:
+            splits_to_process.append(split)
+            continue
+        dataset_dict[split] = _select_dataset_rows(
+            cached_dataset,
+            (max_rows_by_split or {}).get(split, 0),
+        )
+
+    data_dict = {}
+    if splits_to_process:
+        data_dict, _, _ = load_sampled_dataset(
+            data_root=data_root,
+            dataname=dataname,
+            splits=splits_to_process,
+            max_rows_by_split=max_rows_by_split,
+            dataset_cache_root=dataset_cache_root,
+        )
+
+    for split in splits_to_process:
+        raw_dataset = data_dict[split]
+        needs_kg = (
+            representation == REPRESENTATION_TEXT and (
+                source_text_field not in raw_dataset.column_names
+                or target_text_field not in raw_dataset.column_names
+            )
+        )
+        map_kwargs = {
+            'function': preprocess_batch,
+            'fn_kwargs': {
+                'pattern_str_2_id': pattern_str_2_id,
+                'kg': kg if needs_kg else None,
+                'representation': representation,
+                'source_text_field': source_text_field,
+                'target_text_field': target_text_field,
+            },
+            'batched': True,
+            'batch_size': dataset_map_batch_size,
+            'remove_columns': raw_dataset.column_names,
+            'load_from_cache_file': True,
+            'keep_in_memory': False,
+            'desc': f'preprocess_{split}',
+        }
+        if dataset_num_proc is not None and dataset_num_proc > 1:
+            map_kwargs['num_proc'] = dataset_num_proc
+        dataset_dict[split] = raw_dataset.map(**map_kwargs)
 
     return dataset_dict, nentity, nrelation

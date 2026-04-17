@@ -2,9 +2,11 @@ import os
 from pathlib import Path
 import sys
 import json
+import shutil
 
 import pandas as pd
 import pickle
+from datasets import Dataset as HFDataset, load_from_disk
 import pykeen.datasets as pk_datasets
 import pykeen.utils as pk_utils
 import networkx as nx
@@ -20,6 +22,7 @@ import yaml
 
 
 KG_CACHE_DIR = './metadata/kg_cache'
+DATASET_CACHE_DIR = './dataset_cache'
 
 def load_model(path,contents,return_huggingface_model=True,epoch=0,
                model=None, optimizer=None, scheduler=None):
@@ -58,22 +61,146 @@ def load_model(path,contents,return_huggingface_model=True,epoch=0,
         model = model.transformer
     return model, optimizer, scheduler, last_epoch, loss_log
 
-def load_jsonl(data_path, max_rows: int = 0):
-    if max_rows is not None and max_rows > 0:
-        records = []
-        with open(data_path, 'r', encoding='utf-8') as input_file:
-            for row_id, line in enumerate(input_file):
-                if row_id >= max_rows:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                records.append(json.loads(line))
-        return records
+def resolve_dataset_cache_path(dataname, dataset_cache_root=None):
+    cache_root = dataset_cache_root or DATASET_CACHE_DIR
+    cache_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", cache_root, dataname))
+    Path(cache_path).mkdir(parents=True, exist_ok=True)
+    return cache_path
 
-    data_dict = pd.read_json(data_path,
-        orient='records', lines=True).to_dict(orient='records')
-    return data_dict
+
+def sanitize_cache_component(value):
+    return ''.join(
+        char if str(char).isalnum() or char in ('-', '_', '.')
+        else '_'
+        for char in str(value)
+    )
+
+
+def build_processed_dataset_cache_key(representation, source_text_field='observation_text', target_text_field='hypothesis_text'):
+    return '__'.join([
+        f'repr-{sanitize_cache_component(representation)}',
+        f'src-{sanitize_cache_component(source_text_field)}',
+        f'tgt-{sanitize_cache_component(target_text_field)}',
+    ])
+
+
+def resolve_processed_dataset_cache_path(
+        dataname,
+        split,
+        representation,
+        source_text_field='observation_text',
+        target_text_field='hypothesis_text',
+        dataset_cache_root=None):
+    cache_root = resolve_dataset_cache_path(dataname, dataset_cache_root=dataset_cache_root)
+    cache_key = build_processed_dataset_cache_key(
+        representation=representation,
+        source_text_field=source_text_field,
+        target_text_field=target_text_field,
+    )
+    return os.path.join(cache_root, 'processed', cache_key, split)
+
+
+def load_saved_processed_dataset(
+        dataname,
+        split,
+        representation,
+        source_text_field='observation_text',
+        target_text_field='hypothesis_text',
+        dataset_cache_root=None):
+    dataset_path = resolve_processed_dataset_cache_path(
+        dataname=dataname,
+        split=split,
+        representation=representation,
+        source_text_field=source_text_field,
+        target_text_field=target_text_field,
+        dataset_cache_root=dataset_cache_root,
+    )
+    if not os.path.exists(os.path.join(dataset_path, 'state.json')):
+        return None
+    return load_from_disk(dataset_path)
+
+
+def save_processed_dataset_to_disk(
+        dataset,
+        dataname,
+        split,
+        representation,
+        source_text_field='observation_text',
+        target_text_field='hypothesis_text',
+        dataset_cache_root=None,
+        overwrite=False):
+    dataset_path = resolve_processed_dataset_cache_path(
+        dataname=dataname,
+        split=split,
+        representation=representation,
+        source_text_field=source_text_field,
+        target_text_field=target_text_field,
+        dataset_cache_root=dataset_cache_root,
+    )
+    if os.path.exists(dataset_path):
+        if not overwrite:
+            raise FileExistsError(f'Processed dataset cache already exists: {dataset_path}')
+        shutil.rmtree(dataset_path)
+    Path(dataset_path).parent.mkdir(parents=True, exist_ok=True)
+    dataset.save_to_disk(dataset_path)
+    return dataset_path
+
+
+def normalize_json_record(record):
+    normalized = dict(record)
+    query = normalized.get('query')
+    if isinstance(query, list):
+        normalized['query'] = json.dumps(query, ensure_ascii=False)
+    return normalized
+
+
+def iter_jsonl_records(data_path, max_rows: int = 0):
+    rows_read = 0
+    with open(data_path, 'r', encoding='utf-8') as source_file:
+        for line in source_file:
+            line = line.strip()
+            if not line:
+                continue
+            yield normalize_json_record(json.loads(line))
+            rows_read += 1
+            if max_rows is not None and max_rows > 0 and rows_read >= max_rows:
+                break
+
+
+def resolve_raw_dataset_cache_path(data_path, split, max_rows=0, dataset_cache_root=None, dataname=None):
+    cache_dir = resolve_dataset_cache_path(dataname or 'default', dataset_cache_root=dataset_cache_root)
+    row_tag = 'full' if max_rows is None or max_rows <= 0 else f'first{int(max_rows)}'
+    dataset_name = sanitize_cache_component(Path(data_path).stem)
+    return os.path.join(cache_dir, 'raw', f'{dataset_name}-{sanitize_cache_component(split)}-{row_tag}')
+
+
+def load_jsonl_as_hf_dataset(data_path, split: str, dataset_cache_root=None, dataname=None, max_rows: int = 0):
+    dataset_path = resolve_raw_dataset_cache_path(
+        data_path=data_path,
+        split=split,
+        max_rows=max_rows,
+        dataset_cache_root=dataset_cache_root,
+        dataname=dataname,
+    )
+    cache_state_path = os.path.join(dataset_path, 'state.json')
+    if os.path.exists(cache_state_path) and os.path.getmtime(cache_state_path) >= os.path.getmtime(data_path):
+        return load_from_disk(dataset_path)
+
+    cache_dir = resolve_dataset_cache_path(dataname or 'default', dataset_cache_root=dataset_cache_root)
+    dataset = HFDataset.from_generator(
+        iter_jsonl_records,
+        gen_kwargs={
+            'data_path': data_path,
+            'max_rows': max_rows,
+        },
+        cache_dir=cache_dir,
+        keep_in_memory=False,
+    )
+    if os.path.exists(dataset_path):
+        shutil.rmtree(dataset_path)
+    Path(dataset_path).parent.mkdir(parents=True, exist_ok=True)
+    dataset.save_to_disk(dataset_path)
+    return dataset
 
 
 def resolve_sampled_dataset_path(data_root, dataname, split):
@@ -103,24 +230,35 @@ def resolve_stats_path(data_root, dataname):
         f'Cannot find stats.txt for dataset "{dataname}". Checked: {candidates}'
     )
 
-def load_sampled_dataset(data_root, dataname,
-                         splits=['train', 'valid', 'test'],
-                         max_rows_by_split=None):
-    if max_rows_by_split is None:
-        max_rows_by_split = {}
-    data_dict = {}
-    for split in splits:
-        data_path = resolve_sampled_dataset_path(data_root=data_root, dataname=dataname, split=split)
-        data_dict[split] = load_jsonl(
-            data_path,
-            max_rows=max_rows_by_split.get(split, 0),
-        )
-
+def load_sampled_dataset_stats(data_root, dataname):
     stats_path = resolve_stats_path(data_root=data_root, dataname=dataname)
     with open(stats_path) as f:
         lines = f.readlines()
         nentity = int(lines[0].split('\t')[-1])
         nrelation = int(lines[1].split('\t')[-1])
+    return nentity, nrelation
+
+
+def load_sampled_dataset(data_root, dataname,
+                         splits=['train', 'valid', 'test'],
+                         max_rows_by_split=None,
+                         dataset_cache_root=None):
+    if max_rows_by_split is None:
+        max_rows_by_split = {}
+    data_dict = {}
+    for split in splits:
+        data_path = resolve_sampled_dataset_path(data_root=data_root, dataname=dataname, split=split)
+        max_rows = max_rows_by_split.get(split, 0)
+        dataset = load_jsonl_as_hf_dataset(
+            data_path,
+            split=split,
+            dataset_cache_root=dataset_cache_root,
+            dataname=dataname,
+            max_rows=max_rows,
+        )
+        data_dict[split] = dataset
+
+    nentity, nrelation = load_sampled_dataset_stats(data_root=data_root, dataname=dataname)
     # data_dict['test'] = [
     #     # {"answers":[3454,6345,3018,20909,19824,2802,9397,5144,16510,23708,23678],"query":["(","i","(","n","(","p","(",-549,")","(","e","(",12994,")",")",")",")","(","p","(",-547,")","(","e","(",2618,")",")",")",")"],"pattern_str":"(i,(n,(p,(e))),(p,(e)))"},
     #     # {"answers":[8645,6511,11929,9818,21918,21471],"query":["(","p","(",-195,")","(","u","(","p","(",-269,")","(","e","(",9116,")",")",")","(","p","(",-194,")","(","e","(",9818,")",")",")",")",")"],"pattern_str":"(p,(u,(p,(e)),(p,(e))))"},

@@ -1278,6 +1278,9 @@ def my_parse_args():
     parser.add_argument('--experiment_name', default='')
     parser.add_argument('--comparison_samples', type=int, default=3)
     parser.add_argument('--comparison_frequency', type=int, default=0)
+    parser.add_argument('--dataset_cache_root', default='./dataset_cache/')
+    parser.add_argument('--dataset_num_proc', type=int, default=1)
+    parser.add_argument('--dataset_map_batch_size', type=int, default=1000)
 
     parser.add_argument('--pattern_path', type=str, default="./metadata/pattern_filtered.csv")
 
@@ -1385,6 +1388,9 @@ def main():
         source_text_field=args.source_text_field,
         target_text_field=args.target_text_field,
         representation=args.representation,
+        dataset_cache_root=args.dataset_cache_root,
+        dataset_num_proc=args.dataset_num_proc,
+        dataset_map_batch_size=args.dataset_map_batch_size,
     )
 
     if args.max_train_rows > 0 and 'train' in dataset_dict:
