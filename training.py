@@ -9,6 +9,7 @@ import platform
 import random
 import subprocess
 import sys
+import time
 
 import pandas as pd
 import torch
@@ -126,6 +127,30 @@ def append_text_log(log_path, message):
     pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, 'a', encoding='utf-8') as log_file:
         log_file.write(message + '\n')
+
+
+def emit_text_log(message, log_path=None, also_print=False):
+    if log_path is not None:
+        append_text_log(log_path, message)
+    if also_print:
+        print(message, flush=True)
+
+
+def format_seconds(seconds):
+    seconds = max(int(seconds), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f'{hours:02d}:{minutes:02d}:{secs:02d}'
+    return f'{minutes:02d}:{secs:02d}'
+
+
+def should_emit_periodic_log(step, total_steps, every):
+    if total_steps <= 0:
+        return False
+    if step == 1 or step == total_steps:
+        return True
+    return every > 0 and step % every == 0
 
 
 def collect_dataset_sizes(dataset_dict):
@@ -444,8 +469,8 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
 
     model_for_generation = accelerator.unwrap_model(model) if accelerator is not None else model
     model_for_generation.eval()
-    append_text_log(log_path, '')
-    append_text_log(log_path, f'===== {stage_label} =====')
+    emit_text_log('', log_path, also_print=args.comparison_console)
+    emit_text_log(f'===== {stage_label} =====', log_path, also_print=args.comparison_console)
 
     for split in ['train', 'valid']:
         if split not in dataset_dict:
@@ -453,7 +478,11 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
 
         dataset = dataset_dict[split]
         indices = select_sample_indices(len(dataset), args.comparison_samples)
-        append_text_log(log_path, f'[{split}] logged_indices={indices}')
+        emit_text_log(
+            f'[{split}] logged_indices={indices}',
+            log_path,
+            also_print=args.comparison_console,
+        )
 
         for sample_index in indices:
             sample = wrap_single_sample(dataset[sample_index])
@@ -500,23 +529,27 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
                 prediction = tokenizer.batch_decode(pred, skip_special_tokens=True)[0].strip()
 
             condition_value = condition[0] if condition else ''
-            append_text_log(
-                log_path,
+            emit_text_log(
                 f'[{split}] idx={sample_index} pattern_id={pattern_id[0]}',
-            )
-            append_text_log(
                 log_path,
+                also_print=args.comparison_console,
+            )
+            emit_text_log(
                 f'[{split}] INPUT  : {build_logged_input(source[0], condition_value)}',
-            )
-            append_text_log(
                 log_path,
+                also_print=args.comparison_console,
+            )
+            emit_text_log(
                 f'[{split}] TARGET : {target[0]}',
-            )
-            append_text_log(
                 log_path,
-                f'[{split}] PRED   : {prediction}',
+                also_print=args.comparison_console,
             )
-            append_text_log(log_path, '')
+            emit_text_log(
+                f'[{split}] PRED   : {prediction}',
+                log_path,
+                also_print=args.comparison_console,
+            )
+            emit_text_log('', log_path, also_print=args.comparison_console)
 
 
 def reward_add(score: dict):
@@ -677,12 +710,22 @@ def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_g
 
 
 def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
-               device, src_len, tgt_len, accelerator=None):
+               device, src_len, tgt_len, accelerator=None, epoch=None, total_epochs=None):
     model.train()
     niter = len(dataloader)
-    total_loss = 0
+    total_loss = 0.0
+    effective_total = min(niter, args.max_train_batches) if args.max_train_batches > 0 else niter
+    start_time = time.time()
 
-    for iter, sample in (pbar := tqdm(enumerate(dataloader), total=niter)):
+    iterator = enumerate(dataloader, start=1)
+    if args.progress_bar:
+        iterator = tqdm(
+            iterator,
+            total=effective_total,
+            disable=(accelerator is not None) and (not accelerator.is_local_main_process),
+        )
+
+    for step, sample in iterator:
         batch = extract_sample_batch(
             args=args,
             device=device,
@@ -698,9 +741,8 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
 
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-        _loss = loss.detach().cpu().numpy()
-        pbar.set_description(f'loss: {_loss}')
-        total_loss += _loss
+        loss_value = float(loss.detach().item())
+        total_loss += loss_value
 
         if accelerator is not None:
             accelerator.backward(loss)
@@ -709,10 +751,28 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
         optimizer.step()
         scheduler.step()
 
-        if args.max_train_batches > 0 and (iter + 1) >= args.max_train_batches:
+        if should_emit_periodic_log(step, effective_total, args.train_log_every):
+            elapsed = max(time.time() - start_time, 1e-8)
+            avg_loss = total_loss / step
+            it_per_sec = step / elapsed
+            remaining_steps = max(effective_total - step, 0)
+            eta_seconds = remaining_steps / it_per_sec if it_per_sec > 0 else 0
+            epoch_label = f'{epoch}/{total_epochs}' if epoch is not None and total_epochs is not None else str(epoch or '?')
+            progress_pct = (step / effective_total * 100.0) if effective_total > 0 else 0.0
+            print(
+                f'[train][epoch {epoch_label}] '
+                f'step {step}/{effective_total} ({progress_pct:5.1f}%) '
+                f'loss={loss_value:.6f} avg={avg_loss:.6f} '
+                f'lr={scheduler.get_last_lr()[0]:.3e} '
+                f'{it_per_sec:.2f} it/s '
+                f'elapsed={format_seconds(elapsed)} eta={format_seconds(eta_seconds)}',
+                flush=True,
+            )
+
+        if args.max_train_batches > 0 and step >= args.max_train_batches:
             break
 
-    denom = min(niter, args.max_train_batches) if args.max_train_batches > 0 else niter
+    denom = effective_total
     return total_loss / max(denom, 1)
 
 
@@ -848,7 +908,9 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
             device=device,
             src_len=src_len,
             tgt_len=tgt_len,
-            accelerator=accelerator)
+            accelerator=accelerator,
+            epoch=epoch,
+            total_epochs=nepoch)
 
         if ('-5' in model_name or '-01' in model_name):
             scheduler.step()
@@ -872,7 +934,14 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
         msg = f'epoch: {epoch}, train loss: {loss_train}'
         if loss_valid is not None:
             msg += f', valid loss: {loss_valid}'
+        if epoch > 1 and (epoch - 1) in loss_log['train']:
+            train_delta = loss_train - loss_log['train'][epoch - 1]
+            msg += f', train delta: {train_delta:+.6f}'
+        if loss_valid is not None and (epoch - 1) in loss_log['valid']:
+            valid_delta = loss_valid - loss_log['valid'][epoch - 1]
+            msg += f', valid delta: {valid_delta:+.6f}'
         logging.info(msg)
+        print(f'[epoch-summary] {msg}', flush=True)
         with open(result_path, 'a') as result_file:
             result_file.write(msg + '\n')
         if experiment_record is not None:
@@ -1277,7 +1346,10 @@ def my_parse_args():
     parser.add_argument('--optim_experiment_root', default='./results/optim_experiments/')
     parser.add_argument('--experiment_name', default='')
     parser.add_argument('--comparison_samples', type=int, default=3)
-    parser.add_argument('--comparison_frequency', type=int, default=0)
+    parser.add_argument('--comparison_frequency', type=int, default=1)
+    parser.add_argument('--comparison_console', type=str2bool, default=True)
+    parser.add_argument('--train_log_every', type=int, default=5000)
+    parser.add_argument('--progress_bar', type=str2bool, default=False)
     parser.add_argument('--dataset_cache_root', default='./dataset_cache/')
     parser.add_argument('--dataset_num_proc', type=int, default=1)
     parser.add_argument('--dataset_map_batch_size', type=int, default=1000)
