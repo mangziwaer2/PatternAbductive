@@ -1,5 +1,4 @@
 import argparse
-import ast
 import csv
 import datetime
 import inspect
@@ -10,11 +9,6 @@ import platform
 import random
 import subprocess
 import sys
-import time
-
-from utils.runtime import bootstrap_runtime_environment
-
-bootstrap_runtime_environment(repo_root=pathlib.Path(__file__).resolve().parent)
 
 import pandas as pd
 import torch
@@ -32,6 +26,7 @@ from model.tokenizer import (
     create_text_tokenizer,
     decode_text_token_ids,
     get_text_extra_tokens,
+    source_to_prompt,
 )
 from model.transformer import create_transformer, GPT2_MODEL_PATH
 from utils.dataloader import (
@@ -127,55 +122,10 @@ def append_csv_row(csv_path, fieldnames, row):
         writer.writerow(row)
 
 
-def console_print(message):
-    if message == '':
-        print('', flush=True)
-        return
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f'[{timestamp}] {message}', flush=True)
-
-
-def append_text_log(log_path, message, mirror_to_console=False):
+def append_text_log(log_path, message):
     pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, 'a', encoding='utf-8') as log_file:
         log_file.write(message + '\n')
-    if mirror_to_console:
-        console_print(message)
-
-
-def reset_text_log(log_path):
-    pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, 'w', encoding='utf-8') as log_file:
-        log_file.write('')
-
-
-def should_use_tqdm(args):
-    return not args.disable_tqdm and args.console_mode != 'kaggle'
-
-
-def should_mirror_comparison_logs(args):
-    return args.console_show_comparisons or args.console_mode == 'kaggle'
-
-
-def should_emit_periodic_log(step, total_steps, frequency):
-    if total_steps <= 0:
-        return False
-    if step == 1 or step == total_steps:
-        return True
-    if frequency is None or frequency <= 0:
-        return False
-    return step % frequency == 0
-
-
-def format_duration(seconds):
-    if seconds is None:
-        return 'unknown'
-    seconds = max(int(seconds), 0)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f'{hours:02d}:{minutes:02d}:{secs:02d}'
-    return f'{minutes:02d}:{secs:02d}'
 
 
 def collect_dataset_sizes(dataset_dict):
@@ -200,7 +150,8 @@ def prepare_experiment_record(args, dataset_dict, config_train, config_dataloade
     }
 
     for clear_path in [paths['comparison_log_path'], paths['run_log_path']]:
-        reset_text_log(clear_path)
+        if os.path.exists(clear_path):
+            os.remove(clear_path)
 
     metadata = {
         'experiment_name': experiment_name,
@@ -262,7 +213,8 @@ def prepare_rl_experiment_record(args, dataset_dict, device):
     }
 
     for clear_path in [paths['comparison_log_path'], paths['run_log_path']]:
-        reset_text_log(clear_path)
+        if os.path.exists(clear_path):
+            os.remove(clear_path)
 
     metadata = {
         'experiment_name': experiment_name,
@@ -490,11 +442,10 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
     if args.comparison_samples <= 0:
         return
 
-    mirror_to_console = should_mirror_comparison_logs(args)
     model_for_generation = accelerator.unwrap_model(model) if accelerator is not None else model
     model_for_generation.eval()
-    append_text_log(log_path, '', mirror_to_console=mirror_to_console)
-    append_text_log(log_path, f'===== {stage_label} =====', mirror_to_console=mirror_to_console)
+    append_text_log(log_path, '')
+    append_text_log(log_path, f'===== {stage_label} =====')
 
     for split in ['train', 'valid']:
         if split not in dataset_dict:
@@ -502,7 +453,7 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
 
         dataset = dataset_dict[split]
         indices = select_sample_indices(len(dataset), args.comparison_samples)
-        append_text_log(log_path, f'[{split}] logged_indices={indices}', mirror_to_console=mirror_to_console)
+        append_text_log(log_path, f'[{split}] logged_indices={indices}')
 
         for sample_index in indices:
             sample = wrap_single_sample(dataset[sample_index])
@@ -552,24 +503,20 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
             append_text_log(
                 log_path,
                 f'[{split}] idx={sample_index} pattern_id={pattern_id[0]}',
-                mirror_to_console=mirror_to_console,
             )
             append_text_log(
                 log_path,
-                f'[{split}] FULL_INPUT : {build_logged_input(source[0], condition_value)}',
-                mirror_to_console=mirror_to_console,
+                f'[{split}] INPUT  : {build_logged_input(source[0], condition_value)}',
             )
             append_text_log(
                 log_path,
                 f'[{split}] TARGET : {target[0]}',
-                mirror_to_console=mirror_to_console,
             )
             append_text_log(
                 log_path,
                 f'[{split}] PRED   : {prediction}',
-                mirror_to_console=mirror_to_console,
             )
-            append_text_log(log_path, '', mirror_to_console=mirror_to_console)
+            append_text_log(log_path, '')
 
 
 def reward_add(score: dict):
@@ -590,15 +537,15 @@ def reward_add(score: dict):
 
 
 
-def reward_func(prompts, completions, target, source, condition_for_rl=None, **kwargs):
+def reward_func(prompts, completions, target, source, condition_text_textual=None, **kwargs):
     if rl_representation == REPRESENTATION_TEXT:
-        if condition_for_rl is None:
-            condition_for_rl = [''] * len(completions)
+        if condition_text_textual is None:
+            condition_text_textual = [''] * len(completions)
         scores = score_text_query_batch(
             completions=completions,
             targets=target,
             sources=source,
-            condition_texts=condition_for_rl,
+            condition_texts=condition_text_textual,
             kg=rl_kg,
             graph_samplers=graph_samplers,
             searching_split=rl_search_split,
@@ -619,80 +566,24 @@ def reward_func(prompts, completions, target, source, condition_for_rl=None, **k
     return [float(reward_add(score)) for score in scores]
 
 
-def build_grpo_dataset(dataset, args, cache_file_path=None, arrow_batch_size=1000):
-    from datasets import Dataset as HFDataset
-    import pyarrow as pa
-    import pyarrow.ipc as pa_ipc
-
-    condition_key = getattr(args, 'condition_field', 'condition_text_textual')
-    keep_columns = ['prompt', 'source', 'target', 'condition_for_rl']
-
-    def iter_enriched_batches():
-        total_rows = len(dataset)
-        step = max(int(arrow_batch_size), 1)
-        for start in range(0, total_rows, step):
-            end = min(start + step, total_rows)
-            batch = dataset[start:end]
-            batch_size = len(batch['source'])
-            enriched = {key: [] for key in keep_columns}
-            for idx in range(batch_size):
-                source = batch['source'][idx]
-                target = batch['target'][idx]
-                condition_value = ''
-                if condition_key in batch:
-                    condition_value = batch[condition_key][idx]
-                prompt = build_logged_input(source, condition_value)
-                enriched['prompt'].append(prompt)
-                enriched['source'].append(source)
-                enriched['target'].append(target)
-                enriched['condition_for_rl'].append(condition_value if condition_value is not None else '')
-            yield enriched
-
-    if cache_file_path:
-        pathlib.Path(cache_file_path).parent.mkdir(parents=True, exist_ok=True)
-        if os.path.exists(cache_file_path):
-            os.remove(cache_file_path)
-        schema = None
-        writer = None
-        with pa.OSFile(str(cache_file_path), 'wb') as sink:
-            try:
-                for enriched_batch in iter_enriched_batches():
-                    table = (
-                        pa.Table.from_pydict(enriched_batch)
-                        if schema is None
-                        else pa.Table.from_pydict(enriched_batch, schema=schema)
-                    )
-                    if writer is None:
-                        schema = table.schema
-                        writer = pa_ipc.new_stream(sink, schema)
-                    writer.write_table(table)
-            finally:
-                if writer is not None:
-                    writer.close()
-        return HFDataset.from_file(str(cache_file_path))
-
-    merged_columns = {key: [] for key in keep_columns}
-    for enriched_batch in iter_enriched_batches():
-        for key, values in enriched_batch.items():
-            merged_columns[key].extend(values)
-    return HFDataset.from_dict(merged_columns)
+def build_grpo_dataset(dataset, args):
+    dataset = dataset.map(lambda example: source_to_prompt(example, args=args))
+    keep_columns = ['prompt', 'source', 'target', 'condition_text_textual']
+    removable = [column for column in dataset.column_names if column not in keep_columns]
+    if removable:
+        dataset = dataset.remove_columns(removable)
+    return dataset
 
 
-def optimize_gpro(args, dataset, dataset_dict, model, tokenizer, graph_sampler, kg, batch_size,
+def optimize_gpro(args, dataset, model, tokenizer, graph_sampler, kg, batch_size,
                   is_gpt, is_act, src_len, tgt_len, experiment_record=None):
     try:
         from trl import GRPOConfig, GRPOTrainer
-        from transformers import TrainerCallback
     except ImportError as exc:
         raise ImportError('TRL is required for optimizing mode. Please install `trl`.') from exc
     print('GRPO Setting Up')
+    dataset = build_grpo_dataset(dataset, args)
     output_dir = experiment_record['paths']['experiment_dir'] if experiment_record is not None else f'./results/optim/{build_experiment_name(args)}'
-    dataset = build_grpo_dataset(
-        dataset,
-        args,
-        cache_file_path=os.path.join(output_dir, 'grpo_dataset_cache.arrow'),
-        arrow_batch_size=args.dataset_map_batch_size,
-    )
     report_to = None if str(args.rl_report_to).lower() in {'', 'none', 'null'} else args.rl_report_to
     grpo_config = GRPOConfig(
         seed=args.seed,
@@ -712,7 +603,6 @@ def optimize_gpro(args, dataset, dataset_dict, model, tokenizer, graph_sampler, 
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         remove_unused_columns=False,
-        disable_tqdm=(args.console_mode == 'kaggle' or args.disable_tqdm),
     )
     print(grpo_config)
 
@@ -734,57 +624,11 @@ def optimize_gpro(args, dataset, dataset_dict, model, tokenizer, graph_sampler, 
     global rl_representation
     rl_representation = args.representation
     global rl_factor
-    parsed_factors = list(ast.literal_eval(args.rl_factor))
+    parsed_factors = list(eval(args.rl_factor))
     while len(parsed_factors) < 4:
         parsed_factors.append(1.0)
     rl_factor = parsed_factors[:4]
     print(rl_factor)
-
-    rl_comparison_frequency_steps = args.rl_comparison_frequency_steps
-    if rl_comparison_frequency_steps <= 0 and args.comparison_frequency > 0:
-        rl_comparison_frequency_steps = args.rl_save_steps
-
-    callbacks = []
-    if rl_comparison_frequency_steps > 0 and experiment_record is not None:
-        append_text_log(
-            experiment_record['paths']['run_log_path'],
-            f'rl_comparison_frequency_steps={rl_comparison_frequency_steps}',
-            mirror_to_console=(args.console_mode == 'kaggle'),
-        )
-
-        class RLComparisonLoggingCallback(TrainerCallback):
-            def __init__(self):
-                self.last_logged_step = 0
-
-            def on_step_end(self, trainer_args, state, control, **kwargs):
-                if state.global_step <= 0:
-                    return control
-                if state.global_step == self.last_logged_step:
-                    return control
-                if state.global_step % rl_comparison_frequency_steps != 0:
-                    return control
-                if hasattr(state, 'is_world_process_zero') and not state.is_world_process_zero:
-                    return control
-                current_model = kwargs.get('model')
-                if current_model is None:
-                    return control
-                log_prediction_comparisons(
-                    args=args,
-                    dataset_dict=dataset_dict,
-                    model=current_model,
-                    tokenizer=tokenizer,
-                    src_len=src_len,
-                    tgt_len=tgt_len,
-                    is_gpt=is_gpt,
-                    is_act=is_act,
-                    accelerator=None,
-                    log_path=experiment_record['paths']['comparison_log_path'],
-                    stage_label=f'rl_step_{state.global_step}',
-                )
-                self.last_logged_step = state.global_step
-                return control
-
-        callbacks.append(RLComparisonLoggingCallback())
 
     original_forward = None
     if 'logits_to_keep' not in inspect.signature(model.forward).parameters:
@@ -807,8 +651,7 @@ def optimize_gpro(args, dataset, dataset_dict, model, tokenizer, graph_sampler, 
         model=model,
         reward_funcs=reward_func,
         train_dataset=dataset,
-        processing_class=tokenizer,
-        callbacks=callbacks or None,
+        processing_class=tokenizer
     )
     trainer_result = trainer.train()
     if original_forward is not None:
@@ -818,11 +661,7 @@ def optimize_gpro(args, dataset, dataset_dict, model, tokenizer, graph_sampler, 
                              f'{args.dataname}-{args.scale}-{args.max_answer_size}-{args.rl_epochs}-optimize-{args.condition}.pth')
     save_model(ckpt_path, 'model', model, epoch=args.rl_epochs)
     if experiment_record is not None:
-        append_text_log(
-            experiment_record['paths']['run_log_path'],
-            json.dumps(trainer_result.metrics, ensure_ascii=False, indent=2),
-            mirror_to_console=(args.console_mode == 'kaggle'),
-        )
+        append_text_log(experiment_record['paths']['run_log_path'], json.dumps(trainer_result.metrics, ensure_ascii=False, indent=2))
     return trainer_result
 
 def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_gen: bool):
@@ -838,24 +677,12 @@ def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_g
 
 
 def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
-               device, src_len, tgt_len, accelerator=None, epoch=None, nepoch=None):
+               device, src_len, tgt_len, accelerator=None):
     model.train()
     niter = len(dataloader)
-    effective_total_steps = min(niter, args.max_train_batches) if args.max_train_batches > 0 else niter
-    total_loss = 0.0
-    processed_steps = 0
-    start_time = time.time()
-    use_tqdm = should_use_tqdm(args)
-    iterator = enumerate(dataloader, start=1)
-    if use_tqdm:
-        iterator = tqdm(iterator, total=effective_total_steps)
-    else:
-        console_print(
-            f'[train] epoch {epoch}/{nepoch} start steps={effective_total_steps} '
-            f'log_every={args.console_log_frequency_steps}'
-        )
+    total_loss = 0
 
-    for step, sample in iterator:
+    for iter, sample in (pbar := tqdm(enumerate(dataloader), total=niter)):
         batch = extract_sample_batch(
             args=args,
             device=device,
@@ -871,11 +698,9 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
 
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-        loss_value = float(loss.detach().cpu())
-        if use_tqdm:
-            iterator.set_description(f'loss: {loss_value:.6f}')
-        total_loss += loss_value
-        processed_steps += 1
+        _loss = loss.detach().cpu().numpy()
+        pbar.set_description(f'loss: {_loss}')
+        total_loss += _loss
 
         if accelerator is not None:
             accelerator.backward(loss)
@@ -884,45 +709,21 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
         optimizer.step()
         scheduler.step()
 
-        if not use_tqdm and should_emit_periodic_log(
-                step=processed_steps,
-                total_steps=effective_total_steps,
-                frequency=args.console_log_frequency_steps):
-            elapsed = time.time() - start_time
-            rate = processed_steps / elapsed if elapsed > 0 else 0.0
-            remaining_steps = max(effective_total_steps - processed_steps, 0)
-            eta_seconds = (remaining_steps / rate) if rate > 0 else None
-            avg_loss = total_loss / max(processed_steps, 1)
-            current_lr = scheduler.get_last_lr()[0] if scheduler is not None else 0.0
-            console_print(
-                f'[train] epoch {epoch}/{nepoch} step {processed_steps}/{effective_total_steps} '
-                f'loss={loss_value:.6f} avg_loss={avg_loss:.6f} '
-                f'lr={current_lr:.2e} speed={rate:.2f}it/s eta={format_duration(eta_seconds)}'
-            )
-
-        if args.max_train_batches > 0 and processed_steps >= args.max_train_batches:
+        if args.max_train_batches > 0 and (iter + 1) >= args.max_train_batches:
             break
 
-    denom = effective_total_steps
+    denom = min(niter, args.max_train_batches) if args.max_train_batches > 0 else niter
     return total_loss / max(denom, 1)
 
 
 @torch.no_grad()
-def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len,
-                  accelerator=None, epoch=None, nepoch=None):
+def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len, accelerator=None):
     model.eval()
     niter = len(dataloader)
-    effective_total_steps = min(niter, args.max_valid_batches) if args.max_valid_batches > 0 else niter
     total_loss = 0.0
     total_steps = 0
-    start_time = time.time()
-    if args.console_mode == 'kaggle':
-        console_print(
-            f'[valid] epoch {epoch}/{nepoch} start steps={effective_total_steps} '
-            f'log_every={args.console_eval_log_frequency_steps}'
-        )
 
-    for step, sample in enumerate(dataloader, start=1):
+    for iter, sample in enumerate(dataloader):
         batch = extract_sample_batch(
             args=args,
             device=device,
@@ -944,45 +745,14 @@ def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len,
             total_loss += float(loss.cpu())
 
         total_steps += 1
-        if args.console_mode == 'kaggle' and should_emit_periodic_log(
-                step=total_steps,
-                total_steps=effective_total_steps,
-                frequency=args.console_eval_log_frequency_steps):
-            elapsed = time.time() - start_time
-            rate = total_steps / elapsed if elapsed > 0 else 0.0
-            remaining_steps = max(effective_total_steps - total_steps, 0)
-            eta_seconds = (remaining_steps / rate) if rate > 0 else None
-            avg_loss = total_loss / max(total_steps, 1)
-            console_print(
-                f'[valid] epoch {epoch}/{nepoch} step {total_steps}/{effective_total_steps} '
-                f'avg_loss={avg_loss:.6f} speed={rate:.2f}it/s eta={format_duration(eta_seconds)}'
-            )
-
-        if args.max_valid_batches > 0 and step >= args.max_valid_batches:
+        if args.max_valid_batches > 0 and (iter + 1) >= args.max_valid_batches:
             break
 
-    denom = effective_total_steps
+    denom = min(niter, args.max_valid_batches) if args.max_valid_batches > 0 else niter
     return total_loss / max(min(total_steps, denom), 1)
 
 
 def load_model_by_mode(args, device, model_name, is_gpt, ntoken=None, config_train=None):
-    def create_base_model():
-        return create_transformer(
-            ntoken=ntoken,
-            special_tokens=special_tokens,
-            model_name=model_name,
-            vocab_size=ntoken if args.representation == REPRESENTATION_TEXT else None,
-            use_pretrained_weights=(args.representation == REPRESENTATION_TEXT and args.use_pretrained_text_model),
-        ).to(device)
-
-    def create_training_optimizer_and_scheduler(model):
-        optimizer = torch.optim.Adam(model.parameters(), lr=float(config_train["lr"]))
-        scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=0.1,
-            total_iters=config_train["warm_up"],
-        )
-        return optimizer, scheduler
 
     if args.mode in ['training', 'testing', 'optimizing'] and args.resume_epoch != 0:
         if args.tuning:
@@ -993,31 +763,29 @@ def load_model_by_mode(args, device, model_name, is_gpt, ntoken=None, config_tra
                 f'{args.dataname}-{args.scale}-{args.max_answer_size}-{args.resume_epoch}-unconditional.pth')
 
         print(f'Loading model: {resume_path}')
-        model = create_base_model()
-        optimizer = None
-        scheduler = None
-        if args.mode == 'training':
-            optimizer, scheduler = create_training_optimizer_and_scheduler(model)
         model, optimizer, scheduler, last_epoch, loss_log = \
-            load_model(
-                resume_path,
-                'model',
-                return_huggingface_model=True,
-                epoch=args.resume_epoch,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-            )
+            load_model(resume_path, 'model', return_huggingface_model=True, epoch=args.resume_epoch)
+        # last_epoch=0
         model.to(device)
+        # Overwrite model name
         model.model_name = model_name
 
     if args.mode in ['training', 'optimizing'] and args.resume_epoch == 0:
         print('Creating model')
-        model = create_base_model()
+        model = create_transformer(
+            ntoken=ntoken,
+            special_tokens=special_tokens,
+            model_name=model_name,
+            vocab_size=ntoken if args.representation == REPRESENTATION_TEXT else None,
+            use_pretrained_weights=(args.representation == REPRESENTATION_TEXT and args.use_pretrained_text_model),
+        ).to(device)
         optimizer = None
         scheduler = None
         if args.mode == 'training':
-            optimizer, scheduler = create_training_optimizer_and_scheduler(model)
+            optimizer = torch.optim.Adam(model.parameters(),
+                lr=float(config_train["lr"]))
+            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer,
+                start_factor=0.1, total_iters=config_train["warm_up"])
         last_epoch=0
         loss_log = {'train': {}, 'valid': {}}
 
@@ -1026,14 +794,8 @@ def load_model_by_mode(args, device, model_name, is_gpt, ntoken=None, config_tra
             f'{args.dataname}-{args.scale}-{args.max_answer_size}-{args.rl_resume_epoch}-optimize-{args.condition}.pth')
         print(f'Loading model: {resume_path}')
         if args.rl_type=='GRPO':
-            model = create_base_model()
-            model, optimizer, scheduler, last_epoch, loss_log = load_model(
-                resume_path,
-                'rlmodel',
-                return_huggingface_model=True,
-                epoch=args.resume_epoch,
-                model=model,
-            )
+            model, optimizer, scheduler, last_epoch, loss_log = \
+            load_model(resume_path, 'rlmodel', return_huggingface_model=True, epoch=args.resume_epoch)
 
         model.model_name = model_name
         model.to(device)
@@ -1076,8 +838,6 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
 
     for epoch in range(last_epoch+1, nepoch+1): # epoch starts from 1
         print('lr:', scheduler.get_last_lr())
-        if args.console_mode == 'kaggle':
-            console_print(f'[epoch {epoch}/{nepoch}] start')
         loss_train = train_loop(
             args=args,
             model=model,
@@ -1088,9 +848,7 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
             device=device,
             src_len=src_len,
             tgt_len=tgt_len,
-            accelerator=accelerator,
-            epoch=epoch,
-            nepoch=nepoch)
+            accelerator=accelerator)
 
         if ('-5' in model_name or '-01' in model_name):
             scheduler.step()
@@ -1108,8 +866,6 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
                 src_len=src_len,
                 tgt_len=tgt_len,
                 accelerator=accelerator,
-                epoch=epoch,
-                nepoch=nepoch,
             )
             loss_log['valid'][epoch] = loss_valid
 
@@ -1117,15 +873,10 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
         if loss_valid is not None:
             msg += f', valid loss: {loss_valid}'
         logging.info(msg)
-        console_print(f'[epoch {epoch}/{nepoch}] {msg}')
         with open(result_path, 'a') as result_file:
             result_file.write(msg + '\n')
         if experiment_record is not None:
-            append_text_log(
-                experiment_record['paths']['run_log_path'],
-                msg,
-                mirror_to_console=False,
-            )
+            append_text_log(experiment_record['paths']['run_log_path'], msg)
             append_csv_row(
                 experiment_record['paths']['loss_csv_path'],
                 ['epoch', 'train_loss', 'valid_loss'],
@@ -1156,7 +907,6 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
             ckpt_path = os.path.join(args.checkpoint_root, args.modelname,\
                 f'{args.dataname}-{args.scale}-{args.max_answer_size}-{epoch}-{args.condition}.pth')
             save_model(ckpt_path, 'model', model, optimizer, scheduler, epoch, loss_log)
-            console_print(f'[checkpoint] saved: {ckpt_path}')
 
         print('=' * 50)
 
@@ -1428,18 +1178,27 @@ def test_loop(args, dataloader, model, tokenizer, graph_samplers, searching_spli
 def save_model(path, contents:str,
                model, optimizer=None, scheduler=None, epoch=None, loss_log=None):
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    if contents not in {'state_dicts', 'model', 'rlmodel'}:
+    if contents == 'state_dicts':
+        print(f'# Saving checkpoint (state_dicts) {path}')
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'epoch': epoch,
+            'loss_log': loss_log
+        }, path)
+    elif contents == 'model':
+        print(f'# Saving checkpoint (model) {path}')
+        torch.save({
+            'model': model,
+            'optimizer': optimizer,
+            'scheduler': scheduler,
+            'epoch': epoch,
+            'loss_log': loss_log
+        }, path)
+    else:
         print(f'# Error: contents "{contents}" not supported')
         exit()
-    print(f'# Saving checkpoint ({contents}) {path}')
-    torch.save({
-        'checkpoint_format': 'state_dicts_v2',
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': None if optimizer is None else optimizer.state_dict(),
-        'scheduler_state_dict': None if scheduler is None else scheduler.state_dict(),
-        'epoch': epoch,
-        'loss_log': loss_log,
-    }, path)
 
 def my_parse_args():
     parser = argparse.ArgumentParser()
@@ -1503,7 +1262,6 @@ def my_parse_args():
     parser.add_argument('--rl_max_completion_length', type=int, default=128)
     parser.add_argument('--rl_logging_steps', type=int, default=10)
     parser.add_argument('--rl_save_steps', type=int, default=100)
-    parser.add_argument('--rl_comparison_frequency_steps', type=int, default=0)
     parser.add_argument('--rl_log_completions', action='store_true')
     parser.add_argument('--rl_report_to', default='none')
 
@@ -1520,11 +1278,6 @@ def my_parse_args():
     parser.add_argument('--experiment_name', default='')
     parser.add_argument('--comparison_samples', type=int, default=3)
     parser.add_argument('--comparison_frequency', type=int, default=0)
-    parser.add_argument('--console_mode', choices=['default', 'kaggle'], default='default')
-    parser.add_argument('--console_log_frequency_steps', type=int, default=200)
-    parser.add_argument('--console_eval_log_frequency_steps', type=int, default=100)
-    parser.add_argument('--console_show_comparisons', type=str2bool, default=False)
-    parser.add_argument('--disable_tqdm', type=str2bool, default=False)
     parser.add_argument('--dataset_cache_root', default='./dataset_cache/')
     parser.add_argument('--dataset_num_proc', type=int, default=1)
     parser.add_argument('--dataset_map_batch_size', type=int, default=1000)
@@ -1748,12 +1501,11 @@ def main():
                 is_act=is_act,
                 accelerator=None,
                 log_path=experiment_record['paths']['comparison_log_path'],
-                stage_label='rl_initial',
+                stage_label='before_grpo',
             )
             trainer_result = optimize_gpro(
                 args=args,
                 dataset=dataset_dict['train'],
-                dataset_dict=dataset_dict,
                 model=model,
                 tokenizer=tokenizer,
                 graph_sampler=graph_samplers,
@@ -1774,7 +1526,7 @@ def main():
                 is_act=is_act,
                 accelerator=None,
                 log_path=experiment_record['paths']['comparison_log_path'],
-                stage_label='rl_final',
+                stage_label='after_grpo',
             )
             write_rl_experiment_summary(experiment_record, trainer_result, args)
         else:
