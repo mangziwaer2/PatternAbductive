@@ -153,6 +153,10 @@ def should_emit_periodic_log(step, total_steps, every):
     return every > 0 and step % every == 0
 
 
+def average_or_none(values):
+    return (sum(values) / len(values)) if values else None
+
+
 def collect_dataset_sizes(dataset_dict):
     return {
         split: int(dataset.shape[0])
@@ -710,10 +714,12 @@ def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_g
 
 
 def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
-               device, src_len, tgt_len, accelerator=None, epoch=None, total_epochs=None):
+               device, src_len, tgt_len, accelerator=None, epoch=None, total_epochs=None,
+               on_log_step=None):
     model.train()
     niter = len(dataloader)
     total_loss = 0.0
+    window_losses = []
     effective_total = min(niter, args.max_train_batches) if args.max_train_batches > 0 else niter
     start_time = time.time()
 
@@ -743,6 +749,7 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
         loss = outputs.loss
         loss_value = float(loss.detach().item())
         total_loss += loss_value
+        window_losses.append(loss_value)
 
         if accelerator is not None:
             accelerator.backward(loss)
@@ -754,6 +761,7 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
         if should_emit_periodic_log(step, effective_total, args.train_log_every):
             elapsed = max(time.time() - start_time, 1e-8)
             avg_loss = total_loss / step
+            window_avg = average_or_none(window_losses)
             it_per_sec = step / elapsed
             remaining_steps = max(effective_total - step, 0)
             eta_seconds = remaining_steps / it_per_sec if it_per_sec > 0 else 0
@@ -762,12 +770,21 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
             print(
                 f'[train][epoch {epoch_label}] '
                 f'step {step}/{effective_total} ({progress_pct:5.1f}%) '
-                f'loss={loss_value:.6f} avg={avg_loss:.6f} '
+                f'loss={loss_value:.6f} window_avg={window_avg:.6f} global_avg={avg_loss:.6f} '
                 f'lr={scheduler.get_last_lr()[0]:.3e} '
                 f'{it_per_sec:.2f} it/s '
                 f'elapsed={format_seconds(elapsed)} eta={format_seconds(eta_seconds)}',
                 flush=True,
             )
+            if on_log_step is not None:
+                on_log_step(
+                    step=step,
+                    effective_total=effective_total,
+                    loss_value=loss_value,
+                    window_avg=window_avg,
+                    global_avg=avg_loss,
+                )
+            window_losses.clear()
 
         if args.max_train_batches > 0 and step >= args.max_train_batches:
             break
@@ -777,7 +794,7 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
 
 
 @torch.no_grad()
-def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len, accelerator=None):
+def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len, accelerator=None, max_batches=None):
     model.eval()
     niter = len(dataloader)
     total_loss = 0.0
@@ -805,10 +822,12 @@ def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len, 
             total_loss += float(loss.cpu())
 
         total_steps += 1
-        if args.max_valid_batches > 0 and (iter + 1) >= args.max_valid_batches:
+        effective_max_batches = max_batches if max_batches is not None else args.max_valid_batches
+        if effective_max_batches > 0 and (iter + 1) >= effective_max_batches:
             break
 
-    denom = min(niter, args.max_valid_batches) if args.max_valid_batches > 0 else niter
+    effective_max_batches = max_batches if max_batches is not None else args.max_valid_batches
+    denom = min(niter, effective_max_batches) if effective_max_batches > 0 else niter
     return total_loss / max(min(total_steps, denom), 1)
 
 
@@ -898,6 +917,51 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
 
     for epoch in range(last_epoch+1, nepoch+1): # epoch starts from 1
         print('lr:', scheduler.get_last_lr())
+
+        def on_train_log_step(step, effective_total, loss_value, window_avg, global_avg):
+            if valid_dataloader is not None and args.intra_epoch_eval_every > 0 and step % args.intra_epoch_eval_every == 0:
+                snapshot_valid = evaluate_loop(
+                    args=args,
+                    model=model,
+                    tokenizer=tokenizer,
+                    dataloader=valid_dataloader,
+                    device=device,
+                    src_len=src_len,
+                    tgt_len=tgt_len,
+                    accelerator=accelerator,
+                    max_batches=args.intra_epoch_eval_batches,
+                )
+                msg = (
+                    f'[valid-snapshot][epoch {epoch}/{nepoch}] '
+                    f'step {step}/{effective_total} '
+                    f'train_window_avg={window_avg:.6f} '
+                    f'valid_snapshot={snapshot_valid:.6f} '
+                    f'valid_batches={args.intra_epoch_eval_batches if args.intra_epoch_eval_batches > 0 else "all"}'
+                )
+                logging.info(msg)
+                print(msg, flush=True)
+                if experiment_record is not None:
+                    append_text_log(experiment_record['paths']['run_log_path'], msg)
+
+            if (
+                experiment_record is not None
+                and args.intra_epoch_comparison_every > 0
+                and step % args.intra_epoch_comparison_every == 0
+            ):
+                log_prediction_comparisons(
+                    args=args,
+                    dataset_dict=dataset_dict,
+                    model=model,
+                    tokenizer=tokenizer,
+                    src_len=src_len,
+                    tgt_len=tgt_len,
+                    is_gpt=is_gpt,
+                    is_act=is_act,
+                    accelerator=accelerator,
+                    log_path=experiment_record['paths']['comparison_log_path'],
+                    stage_label=f'epoch_{epoch}_step_{step}',
+                )
+
         loss_train = train_loop(
             args=args,
             model=model,
@@ -910,7 +974,8 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
             tgt_len=tgt_len,
             accelerator=accelerator,
             epoch=epoch,
-            total_epochs=nepoch)
+            total_epochs=nepoch,
+            on_log_step=on_train_log_step)
 
         if ('-5' in model_name or '-01' in model_name):
             scheduler.step()
@@ -1350,6 +1415,9 @@ def my_parse_args():
     parser.add_argument('--comparison_console', type=str2bool, default=True)
     parser.add_argument('--train_log_every', type=int, default=5000)
     parser.add_argument('--progress_bar', type=str2bool, default=False)
+    parser.add_argument('--intra_epoch_eval_every', type=int, default=5000)
+    parser.add_argument('--intra_epoch_eval_batches', type=int, default=16)
+    parser.add_argument('--intra_epoch_comparison_every', type=int, default=20000)
     parser.add_argument('--dataset_cache_root', default='./dataset_cache/')
     parser.add_argument('--dataset_num_proc', type=int, default=1)
     parser.add_argument('--dataset_map_batch_size', type=int, default=1000)
