@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
 import pandas as pd
 import torch
 from tqdm import tqdm
