@@ -7,7 +7,9 @@ from transformers import AddedToken
 from transformers import GPT2TokenizerFast
 
 from utils.condition import CONDITION_TOKENS
+from utils.kg_hints import build_kg_hints_text
 from utils.textualization import (
+    KG_HINT_TOKENS,
     HYPOTHESIS_STRUCTURE_TOKENS,
     GRAPH_TEXT_TOKENS,
     is_relation_text_token,
@@ -15,7 +17,7 @@ from utils.textualization import (
 
 
 DEFAULT_CONDITION_TOKENS = CONDITION_TOKENS
-TEXT_EXTRA_TOKENS = ['OBS', *DEFAULT_CONDITION_TOKENS, *HYPOTHESIS_STRUCTURE_TOKENS]
+TEXT_EXTRA_TOKENS = ['OBS', *KG_HINT_TOKENS, *DEFAULT_CONDITION_TOKENS, *HYPOTHESIS_STRUCTURE_TOKENS]
 
 
 def get_text_extra_tokens(include_graph_tokens: bool = False):
@@ -44,8 +46,9 @@ def number_to_pattern(input_str):
 
 def new_extract_sample_to_device(device,
                                  sample, tokenizer,
-                                 src_len, tgt_len, is_gen: bool):
-    source = sample['source']
+                                 src_len, tgt_len, is_gen: bool,
+                                 kg_hints_text=None):
+    source = build_conditioned_source(sample['source'], None, kg_hints_text=kg_hints_text)
     target = sample['target']
     pattern_id = sample['pattern_id']
     source_target_tokenized = tokenizer(
@@ -198,37 +201,56 @@ def decode_text_token_ids(tokenizer, token_ids, preserve_whitespace: bool = Fals
     return ' '.join(decoded.split())
 
 
-def build_conditioned_source(source, condition_text):
+def build_conditioned_source(source, condition_text=None, kg_hints_text=None):
     if condition_text is None:
-        return source
+        condition_text = [''] * len(source)
+    if kg_hints_text is None:
+        kg_hints_text = [''] * len(source)
 
     merged_source = []
-    for src, cond in zip(source, condition_text):
-        if cond is None:
-            merged_source.append(src)
-            continue
+    for src, cond, hints in zip(source, condition_text, kg_hints_text):
         cond = str(cond).strip()
-        merged_source.append(src if cond == '' else f'{src} SEP {cond}')
+        hints = str(hints).strip()
+        parts = [src]
+        if cond != '':
+            parts.extend(['SEP', cond])
+        if hints != '':
+            parts.extend(['SEP', hints])
+        merged_source.append(' '.join(parts))
     return merged_source
 
 
-def source_to_prompt(example, args=None):
+def source_to_prompt(example, args=None, kg=None, kg_hint_split: str = 'train'):
     condition_key = 'condition_text_textual'
     if args is not None:
         condition_key = getattr(args, 'condition_field', condition_key)
     condition_text = example.get(condition_key, '')
-    prompt = build_conditioned_source([example['source']], [condition_text])[0]
+    kg_hints_text = ''
+    if (
+            args is not None
+            and getattr(args, 'use_kg_hints', False)
+            and getattr(args, 'representation', None) == 'text'
+            and getattr(args, 'source_text_field', 'observation_text') == 'observation_text'
+            and kg is not None):
+        kg_hints_text = build_kg_hints_text(
+            observation_text=example['source'],
+            kg=kg,
+            condition_text=condition_text,
+            graph_split=kg_hint_split,
+            max_facts=getattr(args, 'kg_hints_max_facts', 8),
+        )
+    prompt = build_conditioned_source([example['source']], [condition_text], [kg_hints_text])[0]
     enriched = dict(example)
     enriched['prompt'] = prompt
     return enriched
 
 
-def new_extract_sample_to_device_pattern(device, sample, tokenizer,src_len, tgt_len, is_gen: bool):
+def new_extract_sample_to_device_pattern(device, sample, tokenizer,src_len, tgt_len, is_gen: bool, kg_hints_text=None):
     source = sample['source']
     target = sample['target']
     pattern_id = sample['pattern_id']
     target_pattern = [number_to_pattern(tgt) for tgt in target]
-    merged_source = build_conditioned_source(source, target_pattern)
+    merged_source = build_conditioned_source(source, target_pattern, kg_hints_text=kg_hints_text)
 
     source_target_tokenized = tokenizer(
         merged_source, target,  # 使用合并后的 source
@@ -273,12 +295,13 @@ def new_extract_sample_to_device_condition(
         src_len,
         tgt_len,
         is_gen: bool,
-        condition_key: str = 'condition_text'):
+        condition_key: str = 'condition_text',
+        kg_hints_text=None):
     source = sample['source']
     target = sample['target']
     pattern_id = sample['pattern_id']
     condition_text = sample[condition_key] if condition_key in sample else [''] * len(source)
-    merged_source = build_conditioned_source(source, condition_text)
+    merged_source = build_conditioned_source(source, condition_text, kg_hints_text=kg_hints_text)
 
     source_target_tokenized = tokenizer(
         merged_source, target,

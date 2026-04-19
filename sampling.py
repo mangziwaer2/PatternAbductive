@@ -7,7 +7,11 @@ from functools import partial
 import pandas as pd
 from tqdm import tqdm
 
-from utils.condition import expand_sample_with_conditions
+from utils.condition import (
+    DEFAULT_EXCLUDED_CONDITION_TYPES,
+    expand_sample_with_conditions,
+    normalize_condition_type_list,
+)
 from utils.load import load_kg
 from utils.textualization import attach_textual_fields
 
@@ -94,6 +98,7 @@ def build_sample_records(args, mode, answers_from, query, pattern_str, base_samp
         max_condition_arity=args.max_condition_arity,
         include_unconditional=args.include_unconditional,
         rng=rng,
+        excluded_condition_types=args.exclude_condition_types,
     )]
 
 
@@ -203,6 +208,7 @@ def write_text_format_manifest(output_dir, args):
             'Kept relation direction markers "+" and "-" to preserve edge direction.',
             'Kept OBS/COND and control labels for disambiguating input structure.',
         ],
+        'exclude_condition_types': args.exclude_condition_types,
     }
     with open(manifest_path, 'w', encoding='utf-8') as manifest_file:
         json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
@@ -296,11 +302,17 @@ def my_parse_args():
     parser.add_argument('--flush-size', type=int, default=5000)
     parser.add_argument('--checkpoint-frequency', type=int, default=1000)
     parser.add_argument('--restart', action='store_true')
+    parser.add_argument(
+        '--exclude-condition-types',
+        dest='exclude_condition_types',
+        default=','.join(sorted(DEFAULT_EXCLUDED_CONDITION_TYPES)),
+    )
     return parser.parse_args()
 
 
 def main():
     args = my_parse_args()
+    args.exclude_condition_types = normalize_condition_type_list(args.exclude_condition_types)
     pattern_table = pd.read_csv(args.pattern_path, index_col='id')
     print(pattern_table)
 

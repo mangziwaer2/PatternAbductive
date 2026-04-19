@@ -59,6 +59,28 @@ def _select_dataset_rows(dataset, max_rows):
     return dataset.select(range(nrows))
 
 
+def filter_dataset_by_excluded_condition_types(dataset, excluded_condition_types=None):
+    if not excluded_condition_types or 'condition_signature' not in dataset.column_names:
+        return dataset
+
+    excluded_condition_types = {
+        str(condition_type).strip()
+        for condition_type in excluded_condition_types
+        if str(condition_type).strip() != ''
+    }
+    if not excluded_condition_types:
+        return dataset
+
+    def keep_example(example):
+        signature = str(example.get('condition_signature', 'unconditional') or 'unconditional')
+        if signature == 'unconditional':
+            return True
+        present_types = {token for token in signature.split('+') if token}
+        return len(present_types.intersection(excluded_condition_types)) == 0
+
+    return dataset.filter(keep_example, load_from_cache_file=False)
+
+
 def _decode_query_value(query):
     if isinstance(query, str):
         query = query.strip()

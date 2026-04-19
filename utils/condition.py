@@ -29,6 +29,7 @@ CONDITION_FIELD_NAMES = {
 }
 
 CONDITION_TOKENS = ['COND', *CONDITION_LABELS.values()]
+DEFAULT_EXCLUDED_CONDITION_TYPES = {'entity-number', 'relation-number'}
 
 
 def normalize_query_wordlist(query):
@@ -126,7 +127,20 @@ def _choose_condition_value(metadata, condition_type, rng):
     raise ValueError(f'Unsupported condition type: {condition_type}')
 
 
-def get_available_condition_types(metadata):
+def normalize_condition_type_list(condition_types) -> list[str]:
+    if condition_types is None:
+        return []
+    if isinstance(condition_types, str):
+        return [
+            token.strip()
+            for token in condition_types.split(',')
+            if token.strip() != ''
+        ]
+    return [str(token).strip() for token in condition_types if str(token).strip() != '']
+
+
+def get_available_condition_types(metadata, excluded_types=None):
+    excluded_types = set(normalize_condition_type_list(excluded_types))
     condition_types = []
     if metadata['pattern']:
         condition_types.append('pattern')
@@ -138,7 +152,7 @@ def get_available_condition_types(metadata):
         condition_types.append('specific-entity')
     if metadata['unique_relations']:
         condition_types.append('specific-relation')
-    return condition_types
+    return [condition_type for condition_type in condition_types if condition_type not in excluded_types]
 
 
 def build_condition_set(condition_types, metadata, rng=None):
@@ -196,13 +210,13 @@ def flatten_condition_set(condition_set):
     return flat
 
 
-def sample_condition_sets(metadata, samples_per_query, max_condition_arity=3, rng=None):
+def sample_condition_sets(metadata, samples_per_query, max_condition_arity=3, rng=None, excluded_types=None):
     if rng is None:
         rng = random
     if samples_per_query <= 0:
         return []
 
-    available_types = get_available_condition_types(metadata)
+    available_types = get_available_condition_types(metadata, excluded_types=excluded_types)
     if not available_types:
         return []
 
@@ -250,7 +264,8 @@ def expand_sample_with_conditions(
         samples_per_query,
         max_condition_arity=3,
         include_unconditional=True,
-        rng=None):
+        rng=None,
+        excluded_condition_types=None):
     if rng is None:
         rng = random
 
@@ -276,11 +291,13 @@ def expand_sample_with_conditions(
             **flatten_condition_set([]),
         })
 
+    excluded_condition_types = normalize_condition_type_list(excluded_condition_types)
     for condition_set in sample_condition_sets(
             metadata=metadata,
             samples_per_query=samples_per_query,
             max_condition_arity=max_condition_arity,
-            rng=rng):
+            rng=rng,
+            excluded_types=excluded_condition_types):
         records.append({
             **shared_fields,
             **flatten_condition_set(condition_set),

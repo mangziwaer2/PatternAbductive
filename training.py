@@ -35,11 +35,14 @@ from model.transformer import create_transformer, GPT2_MODEL_PATH
 from utils.dataloader import (
     new_create_dataset,
     new_create_dataloader,
+    filter_dataset_by_excluded_condition_types,
     REPRESENTATION_ID,
     REPRESENTATION_TEXT,
 )
+from utils.condition import normalize_condition_type_list, DEFAULT_EXCLUDED_CONDITION_TYPES
 from utils.text_constraints import TextConstraintLogitsProcessor
 from utils.load import load_yaml, load_kg, load_model, resolve_sampled_dataset_path
+from utils.kg_hints import build_batch_kg_hints_texts
 from utils.textualization import get_closed_text_tokens
 from utils.text_scoring import score_text_query_batch
 import logging
@@ -406,9 +409,45 @@ def format_logged_condition(condition_value):
     return str(condition_value)
 
 
-def build_logged_input(source_value, condition_value):
+def build_logged_input(source_value, condition_value, kg_hints_value=''):
     condition_value = format_logged_condition(condition_value).strip()
-    return source_value if condition_value == '' else f'{source_value} SEP {condition_value}'
+    kg_hints_value = format_logged_condition(kg_hints_value).strip()
+    parts = [source_value]
+    if condition_value != '':
+        parts.extend(['SEP', condition_value])
+    if kg_hints_value != '':
+        parts.extend(['SEP', kg_hints_value])
+    return ' '.join(parts)
+
+
+def should_use_kg_hints(args):
+    return (
+        args.representation == REPRESENTATION_TEXT
+        and args.use_kg_hints
+        and args.source_text_field == 'observation_text'
+        and args.kg_hints_max_facts > 0
+    )
+
+
+def maybe_build_batch_kg_hints(args, sample, kg, kg_hint_split):
+    if not should_use_kg_hints(args) or kg is None:
+        return None
+
+    source = sample.get('source')
+    if source is None:
+        return None
+
+    condition_texts = [''] * len(source)
+    if args.condition != 'unconditional' and args.condition_field in sample:
+        condition_texts = sample[args.condition_field]
+
+    return build_batch_kg_hints_texts(
+        observation_texts=source,
+        kg=kg,
+        condition_texts=condition_texts,
+        graph_split=kg_hint_split,
+        max_facts=args.kg_hints_max_facts,
+    )
 
 
 def run_generation(
@@ -469,7 +508,7 @@ def run_generation(
 
 @torch.no_grad()
 def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tgt_len,
-                               is_gpt, is_act, accelerator, log_path, stage_label):
+                               is_gpt, is_act, accelerator, log_path, stage_label, kg=None):
     if args.comparison_samples <= 0:
         return
 
@@ -501,6 +540,8 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
                     src_len=src_len,
                     tgt_len=tgt_len,
                     is_gen=True,
+                    kg=kg,
+                    kg_hint_split=split,
                 )
 
             pred = run_generation(
@@ -535,13 +576,17 @@ def log_prediction_comparisons(args, dataset_dict, model, tokenizer, src_len, tg
                 prediction = tokenizer.batch_decode(pred, skip_special_tokens=True)[0].strip()
 
             condition_value = condition[0] if condition else ''
+            kg_hints_value = ''
+            batch_hints = maybe_build_batch_kg_hints(args, sample, kg, split)
+            if batch_hints:
+                kg_hints_value = batch_hints[0]
             emit_text_log(
                 f'[{split}] idx={sample_index} pattern_id={pattern_id[0]}',
                 log_path,
                 also_print=args.comparison_console,
             )
             emit_text_log(
-                f'[{split}] INPUT  : {build_logged_input(source[0], condition_value)}',
+                f'[{split}] INPUT  : {build_logged_input(source[0], condition_value, kg_hints_value)}',
                 log_path,
                 also_print=args.comparison_console,
             )
@@ -605,8 +650,15 @@ def reward_func(prompts, completions, target, source, condition_text_textual=Non
     return [float(reward_add(score)) for score in scores]
 
 
-def build_grpo_dataset(dataset, args):
-    dataset = dataset.map(lambda example: source_to_prompt(example, args=args))
+def build_grpo_dataset(dataset, args, kg, kg_hint_split='train'):
+    dataset = dataset.map(
+        lambda example: source_to_prompt(
+            example,
+            args=args,
+            kg=kg,
+            kg_hint_split=kg_hint_split,
+        )
+    )
     keep_columns = ['prompt', 'source', 'target', 'condition_text_textual']
     removable = [column for column in dataset.column_names if column not in keep_columns]
     if removable:
@@ -621,7 +673,7 @@ def optimize_gpro(args, dataset, model, tokenizer, graph_sampler, kg, batch_size
     except ImportError as exc:
         raise ImportError('TRL is required for optimizing mode. Please install `trl`.') from exc
     print('GRPO Setting Up')
-    dataset = build_grpo_dataset(dataset, args)
+    dataset = build_grpo_dataset(dataset, args, kg=kg, kg_hint_split='train')
     output_dir = experiment_record['paths']['experiment_dir'] if experiment_record is not None else f'./results/optim/{build_experiment_name(args)}'
     report_to = None if str(args.rl_report_to).lower() in {'', 'none', 'null'} else args.rl_report_to
     grpo_config = GRPOConfig(
@@ -703,21 +755,26 @@ def optimize_gpro(args, dataset, model, tokenizer, graph_sampler, kg, batch_size
         append_text_log(experiment_record['paths']['run_log_path'], json.dumps(trainer_result.metrics, ensure_ascii=False, indent=2))
     return trainer_result
 
-def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_gen: bool):
+def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_gen: bool,
+                         kg=None, kg_hint_split='train'):
+    kg_hints_text = maybe_build_batch_kg_hints(args, sample, kg, kg_hint_split)
     if args.condition == 'unconditional':
         return new_extract_sample_to_device(
-            device, sample, tokenizer, src_len, tgt_len, is_gen)
+            device, sample, tokenizer, src_len, tgt_len, is_gen,
+            kg_hints_text=kg_hints_text)
     if args.condition == 'pattern-legacy':
         return new_extract_sample_to_device_pattern(
-            device, sample, tokenizer, src_len, tgt_len, is_gen)
+            device, sample, tokenizer, src_len, tgt_len, is_gen,
+            kg_hints_text=kg_hints_text)
     return new_extract_sample_to_device_condition(
         device, sample, tokenizer, src_len, tgt_len, is_gen,
-        condition_key=args.condition_field)
+        condition_key=args.condition_field,
+        kg_hints_text=kg_hints_text)
 
 
 def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
                device, src_len, tgt_len, accelerator=None, epoch=None, total_epochs=None,
-               on_log_step=None):
+               on_log_step=None, kg=None, kg_hint_split='train'):
     model.train()
     niter = len(dataloader)
     total_loss = 0.0
@@ -742,6 +799,8 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
             src_len=src_len,
             tgt_len=tgt_len,
             is_gen=False,
+            kg=kg,
+            kg_hint_split=kg_hint_split,
         )
         source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, _ = batch
 
@@ -796,7 +855,8 @@ def train_loop(args, model, tokenizer, optimizer, scheduler, dataloader,
 
 
 @torch.no_grad()
-def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len, accelerator=None, max_batches=None):
+def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len,
+                  accelerator=None, max_batches=None, kg=None, kg_hint_split='valid'):
     model.eval()
     niter = len(dataloader)
     total_loss = 0.0
@@ -811,6 +871,8 @@ def evaluate_loop(args, model, tokenizer, dataloader, device, src_len, tgt_len, 
             src_len=src_len,
             tgt_len=tgt_len,
             is_gen=False,
+            kg=kg,
+            kg_hint_split=kg_hint_split,
         )
         _, _, _, input_ids, attention_mask, labels, _, _ = batch
 
@@ -901,7 +963,7 @@ def load_model_by_mode(args, device, model_name, is_gpt, ntoken=None, config_tra
 
 def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_samplers,
         model_name, is_gpt, is_act, src_len, tgt_len,
-        last_epoch, loss_log, accelerator, dataset_dict, experiment_record=None):
+        last_epoch, loss_log, accelerator, dataset_dict, kg, experiment_record=None):
     train_dataloader = dataloader['train']
     valid_dataloader = dataloader.get('valid')
     if accelerator is not None:
@@ -932,6 +994,8 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
                     tgt_len=tgt_len,
                     accelerator=accelerator,
                     max_batches=args.intra_epoch_eval_batches,
+                    kg=kg,
+                    kg_hint_split='valid',
                 )
                 msg = (
                     f'[valid-snapshot][epoch {epoch}/{nepoch}] '
@@ -962,6 +1026,7 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
                     accelerator=accelerator,
                     log_path=experiment_record['paths']['comparison_log_path'],
                     stage_label=f'epoch_{epoch}_step_{step}',
+                    kg=kg,
                 )
 
         loss_train = train_loop(
@@ -977,7 +1042,9 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
             accelerator=accelerator,
             epoch=epoch,
             total_epochs=nepoch,
-            on_log_step=on_train_log_step)
+            on_log_step=on_train_log_step,
+            kg=kg,
+            kg_hint_split='train')
 
         if ('-5' in model_name or '-01' in model_name):
             scheduler.step()
@@ -995,6 +1062,8 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
                 src_len=src_len,
                 tgt_len=tgt_len,
                 accelerator=accelerator,
+                kg=kg,
+                kg_hint_split='valid',
             )
             loss_log['valid'][epoch] = loss_valid
 
@@ -1035,6 +1104,7 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
                     accelerator=accelerator,
                     log_path=experiment_record['paths']['comparison_log_path'],
                     stage_label=f'epoch_{epoch}',
+                    kg=kg,
                 )
 
         # Saving checkpoint
@@ -1059,6 +1129,7 @@ def fit(args, nepoch, dataloader, model, tokenizer, optimizer, scheduler, graph_
             accelerator=accelerator,
             log_path=experiment_record['paths']['comparison_log_path'],
             stage_label='final',
+            kg=kg,
         )
         write_experiment_summary(
             experiment_record=experiment_record,
@@ -1217,12 +1288,14 @@ def test_loop(args, dataloader, model, tokenizer, graph_samplers, searching_spli
                 extract_sample_batch(
                     args=args,
                     device=device,
-                    sample=sample,
-                    tokenizer=tokenizer,
-                    src_len=src_len,
-                    tgt_len=tgt_len,
-                    is_gen=True,
-                )
+                sample=sample,
+                tokenizer=tokenizer,
+                src_len=src_len,
+                tgt_len=tgt_len,
+                is_gen=True,
+                kg=kg,
+                kg_hint_split=searching_split,
+            )
 
             pred = constrained_inference(args,
                 model if accelerator is None else accelerator.unwrap_model(model),
@@ -1425,12 +1498,19 @@ def my_parse_args():
     parser.add_argument('--dataset_map_batch_size', type=int, default=1000)
 
     parser.add_argument('--pattern_path', type=str, default="./metadata/pattern_filtered.csv")
+    parser.add_argument('--use_kg_hints', type=str2bool, default=True)
+    parser.add_argument('--kg_hints_max_facts', type=int, default=8)
+    parser.add_argument(
+        '--exclude_condition_types',
+        default=','.join(sorted(DEFAULT_EXCLUDED_CONDITION_TYPES)),
+    )
 
     args = parser.parse_args()
     return args
 
 def main():
     args = my_parse_args()
+    args.exclude_condition_types = normalize_condition_type_list(args.exclude_condition_types)
     print(f'args:\n{args}\n')
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1535,6 +1615,20 @@ def main():
         dataset_map_batch_size=args.dataset_map_batch_size,
     )
 
+    if args.exclude_condition_types:
+        for split in list(dataset_dict.keys()):
+            before_count = len(dataset_dict[split])
+            dataset_dict[split] = filter_dataset_by_excluded_condition_types(
+                dataset_dict[split],
+                excluded_condition_types=args.exclude_condition_types,
+            )
+            after_count = len(dataset_dict[split])
+            if after_count != before_count:
+                print(
+                    f'# Filtered split "{split}" by excluded condition types '
+                    f'{args.exclude_condition_types}: {before_count} -> {after_count}'
+                )
+
     if args.max_train_rows > 0 and 'train' in dataset_dict:
         nrows = min(dataset_dict['train'].shape[0], args.max_train_rows)
         dataset_dict['train'] = dataset_dict['train'].select(range(nrows))
@@ -1616,6 +1710,7 @@ def main():
             last_epoch, loss_log,
             accelerator=accelerator if args.accelerate else None,
             dataset_dict=dataset_dict,
+            kg=kg,
             experiment_record=experiment_record)
     elif args.mode == 'testing':
         # preprocess_allowed_rel_ent_map(graph_samplers)
@@ -1644,6 +1739,7 @@ def main():
                 accelerator=None,
                 log_path=experiment_record['paths']['comparison_log_path'],
                 stage_label='before_grpo',
+                kg=kg,
             )
             trainer_result = optimize_gpro(
                 args=args,
@@ -1669,6 +1765,7 @@ def main():
                 accelerator=None,
                 log_path=experiment_record['paths']['comparison_log_path'],
                 stage_label='after_grpo',
+                kg=kg,
             )
             write_rl_experiment_summary(experiment_record, trainer_result, args)
         else:
