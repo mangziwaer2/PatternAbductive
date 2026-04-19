@@ -4,7 +4,7 @@ from typing import Optional
 from transformers import GPT2Config, GPT2LMHeadModel
 
 
-GPT2_MODEL_PATH = str('gpt2')
+GPT2_MODEL_PATH = str(Path(__file__).resolve().parents[1] / 'gpt2')
 
 
 def create_transformer(ntoken: int, special_tokens: dict,

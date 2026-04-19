@@ -71,6 +71,10 @@ def build_kg_hints_text(
     out_edges_by_answer = {}
     shared_tail_counts = Counter()
     for answer_id in answer_ids:
+        answer_id = int(answer_id)
+        if not graph.has_node(answer_id):
+            out_edges_by_answer[answer_id] = []
+            continue
         edges = list(graph.out_edges(answer_id, keys=True))
         out_edges_by_answer[answer_id] = edges
         for _, tail_id, _ in edges:
@@ -79,6 +83,7 @@ def build_kg_hints_text(
     scored_facts = []
     seen = set()
     for answer_index, answer_id in enumerate(answer_ids):
+        answer_id = int(answer_id)
         subj_text = entity_id_to_text(answer_id, kg)
         for _, tail_id, relation_id in out_edges_by_answer.get(answer_id, []):
             obj_text = entity_id_to_text(tail_id, kg)
