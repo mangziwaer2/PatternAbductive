@@ -6,6 +6,8 @@ from utils.textualization import (
     observation_text_to_answer_ids,
     query_text_to_wordlist,
     relation_text_to_id,
+    render_surface_tokens,
+    tokenize_surface_text,
 )
 
 
@@ -13,7 +15,7 @@ LABEL_TO_TYPE = {label: condition_type for condition_type, label in CONDITION_LA
 
 
 def parse_textual_condition(condition_text: str):
-    tokens = str(condition_text or '').split()
+    tokens = tokenize_surface_text(condition_text or '')
     if not tokens:
         return {}
     if tokens[0] == 'COND':
@@ -27,11 +29,25 @@ def parse_textual_condition(condition_text: str):
             index += 1
             continue
         index += 1
-        value_tokens = []
-        while index < len(tokens) and tokens[index] not in LABEL_TO_TYPE:
-            value_tokens.append(tokens[index])
+        if label == CONDITION_LABELS['pattern']:
+            value_tokens = []
+            paren_depth = 0
+            while index < len(tokens):
+                token = tokens[index]
+                if paren_depth == 0 and token in LABEL_TO_TYPE:
+                    break
+                value_tokens.append(token)
+                if token == '(':
+                    paren_depth += 1
+                elif token == ')':
+                    paren_depth -= 1
+                index += 1
+            parsed[LABEL_TO_TYPE[label]] = render_surface_tokens(value_tokens)
+            continue
+
+        if index < len(tokens):
+            parsed[LABEL_TO_TYPE[label]] = tokens[index]
             index += 1
-        parsed[LABEL_TO_TYPE[label]] = ' '.join(value_tokens).strip()
     return parsed
 
 

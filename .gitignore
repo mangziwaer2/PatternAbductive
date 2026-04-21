@@ -212,6 +212,7 @@ results/
 run_logs/
 dataloader.pt
 graph_samplers.pt
+*.pptx
 
 # Temporary datasets and backups
 sampled_data_backup/

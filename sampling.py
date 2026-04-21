@@ -13,7 +13,7 @@ from utils.condition import (
     normalize_condition_type_list,
 )
 from utils.load import load_kg
-from utils.textualization import attach_textual_fields
+from utils.text_dataset import build_minimal_text_record
 
 
 STATE_FILENAME = 'sampling_state.json'
@@ -90,16 +90,25 @@ def build_sample_records(args, mode, answers_from, query, pattern_str, base_samp
         'query': query,
         'pattern_str': pattern_str,
     }
-    return [
-        attach_textual_fields(record, kg)
-        for record in expand_sample_with_conditions(
+    expanded_records = expand_sample_with_conditions(
         base_record=base_record,
         samples_per_query=args.condition_samples_per_query,
         max_condition_arity=args.max_condition_arity,
         include_unconditional=args.include_unconditional,
         rng=rng,
         excluded_condition_types=args.exclude_condition_types,
-    )]
+    )
+    return [
+        build_minimal_text_record(
+            record=record,
+            kg=kg,
+            sample_id=(int(base_sample_id) * 1000) + record_index,
+            graph_split=mode,
+            include_kg_hints=True,
+            kg_hints_max_facts=args.kg_hints_max_facts,
+        )
+        for record_index, record in enumerate(expanded_records)
+    ]
 
 
 def flush_records(records, output_path, rng):
@@ -109,7 +118,6 @@ def flush_records(records, output_path, rng):
     rng.shuffle(records)
     with open(output_path, 'a', encoding='utf-8') as output_file:
         for record in records:
-            record['answers'] = [int(idx) for idx in record['answers']]
             output_file.write(json.dumps(record, ensure_ascii=False) + '\n')
     records.clear()
     return row_count
@@ -197,18 +205,23 @@ def write_stats(output_dir, kg):
 def write_text_format_manifest(output_dir, args):
     manifest_path = os.path.join(output_dir, 'text_format_manifest.json')
     manifest = {
-        'format_version': 'compact_text_v1',
+        'format_version': 'surface_text_minimal_v1',
         'dataname': args.dataname,
         'data_root': args.data_root,
         'generated_by': 'sampling.py',
         'changes': [
-            'Sampling writes compact textual fields directly.',
-            'Removed entity prefix "ent:" from textual fields.',
-            'Removed relation prefix "rel:" from textual fields.',
-            'Kept relation direction markers "+" and "-" to preserve edge direction.',
-            'Kept OBS/COND and control labels for disambiguating input structure.',
+            'Sampling writes minimal text-only rows directly.',
+            'Entity and relation names use surface forms with spaces instead of underscores.',
+            'Logical operators use surface tokens like (-p), (-e), (-i), (-u), (-n).',
+            'Entities and relations are wrapped by square brackets for parse-safe text-to-text training.',
+            'KG hints are precomputed into kg_hints_text at sampling time.',
         ],
         'exclude_condition_types': args.exclude_condition_types,
+        'kg_hints_max_facts': args.kg_hints_max_facts,
+        'train_samples_per_pattern': args.train_samples_per_pattern,
+        'valid_samples_per_pattern': args.valid_samples_per_pattern,
+        'test_samples_per_pattern': args.test_samples_per_pattern,
+        'max_patterns_per_split': args.max_patterns_per_split,
     }
     with open(manifest_path, 'w', encoding='utf-8') as manifest_file:
         json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
@@ -294,13 +307,38 @@ def my_parse_args():
     parser.add_argument('-p', '--pattern_path', default='./metadata/pattern_filtered.csv')
     parser.add_argument('-a', '--max-answer-size', type=int, default=32)
     parser.add_argument('-d', '--dataname', default='DBpedia50')
-    parser.add_argument('--data_root', default='./sampled_data_compact/')
+    parser.add_argument('--data_root', default='./sampled_data_surface/')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--condition-samples-per-query', type=int, default=6)
     parser.add_argument('--max-condition-arity', type=int, default=3)
     parser.add_argument('--include-unconditional', action='store_true')
+    parser.add_argument(
+        '--train-samples-per-pattern',
+        type=int,
+        default=0,
+        help='Override train samples per pattern. Default 0 keeps the full original setting.',
+    )
+    parser.add_argument(
+        '--valid-samples-per-pattern',
+        type=int,
+        default=0,
+        help='Override valid samples per pattern. Default 0 keeps the full original setting.',
+    )
+    parser.add_argument(
+        '--test-samples-per-pattern',
+        type=int,
+        default=0,
+        help='Override test samples per pattern. Default 0 keeps the full original setting.',
+    )
+    parser.add_argument(
+        '--max-patterns-per-split',
+        type=int,
+        default=0,
+        help='Limit how many pattern entries are kept per split after shuffling. Useful for smoke experiments.',
+    )
     parser.add_argument('--flush-size', type=int, default=5000)
     parser.add_argument('--checkpoint-frequency', type=int, default=1000)
+    parser.add_argument('--kg-hints-max-facts', type=int, default=8)
     parser.add_argument('--restart', action='store_true')
     parser.add_argument(
         '--exclude-condition-types',
@@ -327,9 +365,9 @@ def main():
 
     print(f'# Sampling from {args.dataname} dataset, num_samples_perpattern:')
     num_samples_perpattern = {
-        'train': num_train_edges,
-        'valid': num_train_edges // 8,
-        'test': num_train_edges // 8,
+        'train': args.train_samples_per_pattern if args.train_samples_per_pattern > 0 else num_train_edges,
+        'valid': args.valid_samples_per_pattern if args.valid_samples_per_pattern > 0 else num_train_edges // 8,
+        'test': args.test_samples_per_pattern if args.test_samples_per_pattern > 0 else num_train_edges // 8,
     }
     print(num_samples_perpattern)
 
@@ -343,6 +381,8 @@ def main():
     for split in ['train', 'valid', 'test']:
         split_rng = random.Random(args.seed + split_offsets[split])
         split_rng.shuffle(patterns_pool[split])
+        if args.max_patterns_per_split > 0:
+            patterns_pool[split] = patterns_pool[split][:args.max_patterns_per_split]
         try:
             sample_mode(
                 args=args,

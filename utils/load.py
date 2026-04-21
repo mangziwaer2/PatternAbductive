@@ -24,28 +24,37 @@ import yaml
 KG_CACHE_DIR = './metadata/kg_cache'
 DATASET_CACHE_DIR = './dataset_cache'
 
+
+def _ensure_rlmodel_unpickle_compat():
+    if transformers is None:
+        return
+    model_class = getattr(transformers, 'GPT2LMHeadModel', None)
+    if model_class is None or hasattr(model_class, 'dummy_add_model_tags'):
+        return
+
+    def dummy_add_model_tags(self, tags):
+        return None
+
+    model_class.dummy_add_model_tags = dummy_add_model_tags
+
+
 def load_model(path,contents,return_huggingface_model=True,epoch=0,
                model=None, optimizer=None, scheduler=None):
     print(f'# Loading checkpoint (model) {path}')
+    if model is not None or optimizer is not None or scheduler is not None:
+        print(f'# Error: cannot pass model, optimizer, scheduler with contents="{contents}"')
+        exit()
+
     if contents=="model":
-        if model is not None or optimizer is not None or scheduler is not None:
-            print('# Error: cannot pass model, optimizer, scheduler with contents="model"')
-            exit()
         checkpoint = torch.load(path,weights_only=False)
         model = checkpoint['model']
         optimizer = checkpoint['optimizer']
         scheduler = checkpoint['scheduler']
     elif contents == 'rlmodel':
-        print(f'# Loading checkpoint (model) {path}')
-        if model is not None or optimizer is not None or scheduler is not None:
-            print('# Error: cannot pass model, optimizer, scheduler with contents="model"')
-            exit()
+        _ensure_rlmodel_unpickle_compat()
         checkpoint = torch.load(path,weights_only=False)
         model = checkpoint['model']
-        model.warnings_issued = {}  # 重新添加属性
-        def dummy_add_model_tags(self, tags):
-            pass
-        model.add_model_tags = dummy_add_model_tags.__get__(model)  # 重新绑定方法
+        model.warnings_issued = {}
         optimizer = checkpoint['optimizer']
         scheduler = checkpoint['scheduler']
     else:
@@ -76,11 +85,16 @@ def sanitize_cache_component(value):
     )
 
 
-def build_processed_dataset_cache_key(representation, source_text_field='observation_text', target_text_field='hypothesis_text'):
+def build_processed_dataset_cache_key(
+        representation,
+        source_text_field='observation_text',
+        target_text_field='hypothesis_text',
+        data_root_tag='default'):
     return '__'.join([
         f'repr-{sanitize_cache_component(representation)}',
         f'src-{sanitize_cache_component(source_text_field)}',
         f'tgt-{sanitize_cache_component(target_text_field)}',
+        f'root-{sanitize_cache_component(data_root_tag)}',
     ])
 
 
@@ -90,12 +104,14 @@ def resolve_processed_dataset_cache_path(
         representation,
         source_text_field='observation_text',
         target_text_field='hypothesis_text',
+        data_root_tag='default',
         dataset_cache_root=None):
     cache_root = resolve_dataset_cache_path(dataname, dataset_cache_root=dataset_cache_root)
     cache_key = build_processed_dataset_cache_key(
         representation=representation,
         source_text_field=source_text_field,
         target_text_field=target_text_field,
+        data_root_tag=data_root_tag,
     )
     return os.path.join(cache_root, 'processed', cache_key, split)
 
@@ -106,6 +122,7 @@ def load_saved_processed_dataset(
         representation,
         source_text_field='observation_text',
         target_text_field='hypothesis_text',
+        data_root_tag='default',
         dataset_cache_root=None):
     dataset_path = resolve_processed_dataset_cache_path(
         dataname=dataname,
@@ -113,6 +130,7 @@ def load_saved_processed_dataset(
         representation=representation,
         source_text_field=source_text_field,
         target_text_field=target_text_field,
+        data_root_tag=data_root_tag,
         dataset_cache_root=dataset_cache_root,
     )
     if not os.path.exists(os.path.join(dataset_path, 'state.json')):
@@ -127,6 +145,7 @@ def save_processed_dataset_to_disk(
         representation,
         source_text_field='observation_text',
         target_text_field='hypothesis_text',
+        data_root_tag='default',
         dataset_cache_root=None,
         overwrite=False):
     dataset_path = resolve_processed_dataset_cache_path(
@@ -135,6 +154,7 @@ def save_processed_dataset_to_disk(
         representation=representation,
         source_text_field=source_text_field,
         target_text_field=target_text_field,
+        data_root_tag=data_root_tag,
         dataset_cache_root=dataset_cache_root,
     )
     if os.path.exists(dataset_path):
@@ -413,11 +433,6 @@ def load_kg(dataname, reverse_edges_flag=True, id_map_only=False):
     if raw_kg_dict == None: return None
 
     path = resolve_kg_cache_path(dataname)
-    legacy_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", f'./sampled_data/{dataname}.pkl'))
-    if not os.path.exists(path) and os.path.exists(legacy_path):
-        kg = load_kg_from_disk(legacy_path)
-        dump_kg(kg, path)
-        return kg
     if os.path.exists(path):
         kg = load_kg_from_disk(path)
     else:

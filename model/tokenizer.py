@@ -1,17 +1,12 @@
 import torch
-from tokenizers.pre_tokenizers import WhitespaceSplit
-from tokenizers.processors import TemplateProcessing
-from tokenizers.models import WordLevel
-from tokenizers import Tokenizer
-from transformers import AddedToken
-from transformers import GPT2TokenizerFast
+from transformers import AddedToken, GPT2TokenizerFast
 
 from utils.condition import CONDITION_TOKENS
 from utils.kg_hints import build_kg_hints_text
 from utils.textualization import (
-    KG_HINT_TOKENS,
-    HYPOTHESIS_STRUCTURE_TOKENS,
     GRAPH_TEXT_TOKENS,
+    HYPOTHESIS_STRUCTURE_TOKENS,
+    KG_HINT_TOKENS,
     is_relation_text_token,
 )
 
@@ -25,123 +20,6 @@ def get_text_extra_tokens(include_graph_tokens: bool = False):
     if include_graph_tokens:
         extra_tokens.extend(GRAPH_TEXT_TOKENS)
     return extra_tokens
-
-def number_to_pattern(input_str):
-    elements = input_str.split()
-
-    result = []
-    for elem in elements:
-        if elem.lstrip('-').isdigit():  # 检查是否是数字（包括负数）
-            num = int(elem)
-            if num < 0:
-                result.append('p')  # 负数变为 p
-            else:
-                result.append('e')  # 正数变为 e
-        else:
-            result.append(elem)  # 非数字保持不变
-
-    output_str = ' '.join(result)
-    return output_str
-
-
-def new_extract_sample_to_device(device,
-                                 sample, tokenizer,
-                                 src_len, tgt_len, is_gen: bool,
-                                 kg_hints_text=None):
-    source = build_conditioned_source(sample['source'], None, kg_hints_text=kg_hints_text)
-    target = sample['target']
-    pattern_id = sample['pattern_id']
-    source_target_tokenized = tokenizer(
-        source, target,
-        padding='longest',
-        # max_length=src_len+tgt_len,
-        return_tensors="pt").to(device)
-    # labels is the source SEP target END, ...
-    labels = torch.clone(source_target_tokenized.input_ids)
-
-    source_tokenized = tokenizer(
-        source,
-        padding='max_length',
-        max_length=labels.shape[-1],
-        return_tensors="pt").to(device)
-    labels[source_tokenized.attention_mask == 1] = tokenizer.pad_token_id
-
-    if is_gen == False:
-            input_ids = source_target_tokenized.input_ids
-            attention_mask = source_target_tokenized.attention_mask
-    else:
-        original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = 'left'
-        source_tokenized = tokenizer(
-            source,
-            padding='longest',
-            max_length=src_len,
-            return_tensors="pt").to(device)
-        tokenizer.padding_side = original_padding_side
-        input_ids = source_tokenized.input_ids
-        attention_mask = source_tokenized.attention_mask
-
-    labels[labels == tokenizer.pad_token_id] = -100
-    source_attention_mask = source_tokenized.attention_mask
-
-    return source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, target
-
-def get_vocab(special_tokens, offset, nentity, nrelation, condition_tokens=None):
-    if condition_tokens is None:
-        condition_tokens = DEFAULT_CONDITION_TOKENS
-
-    vocab = {}
-    vocab.update(special_tokens)
-    for i in range(1, nentity+1): # [offset, offset + nentity - 1]
-        vocab[str(i)] = offset + i - 1
-    for i in range(1, nrelation+1): # [offset + nentity, offset + nentity + nrelation - 1]
-        vocab[str(-i)] = offset + nentity + i - 1
-    next_token_id = offset + nentity + nrelation
-    for token in condition_tokens:
-        if token in vocab:
-            continue
-        vocab[token] = next_token_id
-        next_token_id += 1
-    return vocab, next_token_id
-
-def create_tokenizer(
-        special_tokens: dict, offset: int,
-        nentity: int, nrelation: int,
-        condition_tokens=None):
-    pre_tokenizer = WhitespaceSplit()
-    vocab, vocab_size = get_vocab(
-        special_tokens,
-        offset=offset,
-        nentity=nentity,
-        nrelation=nrelation,
-        condition_tokens=condition_tokens,
-    )
-    model = WordLevel(vocab, unk_token='UNK')
-    post_processor = TemplateProcessing(
-        single='$0 SEP',
-        pair='$A SEP $B END',
-        special_tokens=[('SEP', special_tokens['SEP']), ('END', special_tokens['END'])]
-    )
-    tokenizer = Tokenizer(model=model)
-
-    tokenizer.pre_tokenizer = pre_tokenizer
-    tokenizer.post_processor = post_processor
-    # Just to let the tokenizer know about special tokens
-    tokenizer.add_special_tokens(['START', 'END', 'PAD', 'UNK', 'SEP'])
-    import io
-    from contextlib import redirect_stdout
-    trap = io.StringIO()
-    with redirect_stdout(trap):
-        tokenizer = GPT2TokenizerFast(
-            tokenizer_object=tokenizer,
-            bos_token='START',
-            eos_token='END',
-            pad_token='PAD',
-            unk_token='UNK',
-            sep_token='SEP',
-            ) # default padding side
-        # tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer, vocab_size
 
 
 def create_text_tokenizer(pretrained_model_path: str, extra_tokens=None, closed_text_tokens=None):
@@ -176,7 +54,8 @@ def create_text_tokenizer(pretrained_model_path: str, extra_tokens=None, closed_
 
 def decode_text_token_ids(tokenizer, token_ids, preserve_whitespace: bool = False):
     special_ids = {
-        token_id for token_id in [
+        token_id
+        for token_id in [
             tokenizer.pad_token_id,
             tokenizer.eos_token_id,
             tokenizer.bos_token_id,
@@ -185,12 +64,6 @@ def decode_text_token_ids(tokenizer, token_ids, preserve_whitespace: bool = Fals
         if token_id is not None
     }
     filtered_ids = [token_id for token_id in token_ids if token_id not in special_ids]
-    tokens = tokenizer.convert_ids_to_tokens(filtered_ids)
-    added_tokens = set(tokenizer.get_added_vocab().keys())
-    if tokens and all(
-            token in ['(', ')', 'p', 'i', 'u', 'n', 'e'] or is_relation_text_token(token) or token in added_tokens
-            for token in tokens):
-        return ' '.join(tokens)
     decoded = tokenizer.decode(
         filtered_ids,
         skip_special_tokens=True,
@@ -212,26 +85,70 @@ def build_conditioned_source(source, condition_text=None, kg_hints_text=None):
         cond = str(cond).strip()
         hints = str(hints).strip()
         parts = [src]
-        if cond != '':
+        if cond:
             parts.extend(['SEP', cond])
-        if hints != '':
+        if hints:
             parts.extend(['SEP', hints])
         merged_source.append(' '.join(parts))
     return merged_source
 
 
+def extract_text_sample_to_device(
+        device,
+        sample,
+        tokenizer,
+        src_len,
+        tgt_len,
+        is_gen: bool,
+        kg_hints_text=None):
+    source = sample['source']
+    target = sample['target']
+    pattern_id = sample['pattern_id']
+    condition_text = sample.get('condition_text', [''] * len(source))
+    merged_source = build_conditioned_source(source, condition_text, kg_hints_text=kg_hints_text)
+
+    source_target_tokenized = tokenizer(
+        merged_source,
+        target,
+        padding='longest',
+        return_tensors='pt',
+    ).to(device)
+    labels = torch.clone(source_target_tokenized.input_ids)
+
+    source_tokenized = tokenizer(
+        merged_source,
+        padding='max_length',
+        max_length=labels.shape[-1],
+        return_tensors='pt',
+    ).to(device)
+    labels[source_tokenized.attention_mask == 1] = tokenizer.pad_token_id
+
+    if not is_gen:
+        input_ids = source_target_tokenized.input_ids
+        attention_mask = source_target_tokenized.attention_mask
+    else:
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = 'left'
+        source_tokenized = tokenizer(
+            merged_source,
+            padding='longest',
+            max_length=src_len,
+            return_tensors='pt',
+        ).to(device)
+        tokenizer.padding_side = original_padding_side
+        input_ids = source_tokenized.input_ids
+        attention_mask = source_tokenized.attention_mask
+
+    labels[labels == tokenizer.pad_token_id] = -100
+    source_attention_mask = source_tokenized.attention_mask
+
+    return source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, condition_text
+
+
 def source_to_prompt(example, args=None, kg=None, kg_hint_split: str = 'train'):
-    condition_key = 'condition_text_textual'
-    if args is not None:
-        condition_key = getattr(args, 'condition_field', condition_key)
-    condition_text = example.get(condition_key, '')
-    kg_hints_text = ''
-    if (
-            args is not None
-            and getattr(args, 'use_kg_hints', False)
-            and getattr(args, 'representation', None) == 'text'
-            and getattr(args, 'source_text_field', 'observation_text') == 'observation_text'
-            and kg is not None):
+    condition_text = example.get('condition_text', '')
+    kg_hints_text = example.get('kg_hints_text', '')
+    if not kg_hints_text and args is not None and getattr(args, 'use_kg_hints', False) and kg is not None:
         kg_hints_text = build_kg_hints_text(
             observation_text=example['source'],
             kg=kg,
@@ -245,47 +162,16 @@ def source_to_prompt(example, args=None, kg=None, kg_hint_split: str = 'train'):
     return enriched
 
 
-def new_extract_sample_to_device_pattern(device, sample, tokenizer,src_len, tgt_len, is_gen: bool, kg_hints_text=None):
-    source = sample['source']
-    target = sample['target']
-    pattern_id = sample['pattern_id']
-    target_pattern = [number_to_pattern(tgt) for tgt in target]
-    merged_source = build_conditioned_source(source, target_pattern, kg_hints_text=kg_hints_text)
-
-    source_target_tokenized = tokenizer(
-        merged_source, target,  # 使用合并后的 source
-        padding='longest',
-        return_tensors="pt").to(device)
-    labels = torch.clone(source_target_tokenized.input_ids)
-
-    # 忽略 source 部分的 loss
-    source_tokenized = tokenizer(
-        merged_source,
-        padding='max_length',
-        max_length=labels.shape[-1],
-        return_tensors="pt").to(device)
-    labels[source_tokenized.attention_mask == 1] = tokenizer.pad_token_id
-
-    if not is_gen:  # 训练/验证阶段
-        input_ids = source_target_tokenized.input_ids
-        attention_mask = source_target_tokenized.attention_mask
-    else:  # 测试/生成阶段（左填充）
-        original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = 'left'
-        source_tokenized = tokenizer(
-            merged_source,  # 使用合并后的 source
-            padding='longest',
-            max_length=src_len,
-            return_tensors="pt").to(device)
-        tokenizer.padding_side = original_padding_side
-        input_ids = source_tokenized.input_ids
-        attention_mask = source_tokenized.attention_mask
-
-    # 统一处理 labels 的 padding
-    labels[labels == tokenizer.pad_token_id] = -100
-    source_attention_mask = source_tokenized.attention_mask
-
-    return source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, target_pattern
+def new_extract_sample_to_device(device, sample, tokenizer, src_len, tgt_len, is_gen: bool, kg_hints_text=None):
+    return extract_text_sample_to_device(
+        device=device,
+        sample=sample,
+        tokenizer=tokenizer,
+        src_len=src_len,
+        tgt_len=tgt_len,
+        is_gen=is_gen,
+        kg_hints_text=kg_hints_text,
+    )
 
 
 def new_extract_sample_to_device_condition(
@@ -297,41 +183,27 @@ def new_extract_sample_to_device_condition(
         is_gen: bool,
         condition_key: str = 'condition_text',
         kg_hints_text=None):
-    source = sample['source']
-    target = sample['target']
-    pattern_id = sample['pattern_id']
-    condition_text = sample[condition_key] if condition_key in sample else [''] * len(source)
-    merged_source = build_conditioned_source(source, condition_text, kg_hints_text=kg_hints_text)
+    if condition_key in sample and condition_key != 'condition_text':
+        sample = dict(sample)
+        sample['condition_text'] = sample[condition_key]
+    return extract_text_sample_to_device(
+        device=device,
+        sample=sample,
+        tokenizer=tokenizer,
+        src_len=src_len,
+        tgt_len=tgt_len,
+        is_gen=is_gen,
+        kg_hints_text=kg_hints_text,
+    )
 
-    source_target_tokenized = tokenizer(
-        merged_source, target,
-        padding='longest',
-        return_tensors='pt').to(device)
-    labels = torch.clone(source_target_tokenized.input_ids)
 
-    source_tokenized = tokenizer(
-        merged_source,
-        padding='max_length',
-        max_length=labels.shape[-1],
-        return_tensors='pt').to(device)
-    labels[source_tokenized.attention_mask == 1] = tokenizer.pad_token_id
-
-    if not is_gen:
-        input_ids = source_target_tokenized.input_ids
-        attention_mask = source_target_tokenized.attention_mask
-    else:
-        original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = 'left'
-        source_tokenized = tokenizer(
-            merged_source,
-            padding='longest',
-            max_length=src_len,
-            return_tensors='pt').to(device)
-        tokenizer.padding_side = original_padding_side
-        input_ids = source_tokenized.input_ids
-        attention_mask = source_tokenized.attention_mask
-
-    labels[labels == tokenizer.pad_token_id] = -100
-    source_attention_mask = source_tokenized.attention_mask
-
-    return source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, condition_text
+def new_extract_sample_to_device_pattern(device, sample, tokenizer, src_len, tgt_len, is_gen: bool, kg_hints_text=None):
+    return extract_text_sample_to_device(
+        device=device,
+        sample=sample,
+        tokenizer=tokenizer,
+        src_len=src_len,
+        tgt_len=tgt_len,
+        is_gen=is_gen,
+        kg_hints_text=kg_hints_text,
+    )

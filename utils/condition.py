@@ -77,11 +77,79 @@ def _collect_query_atoms(query_nested):
     raise ValueError(f'Unsupported operator: {operator}')
 
 
+def _tokenize_pattern(pattern_str: str) -> list[str]:
+    tokens = []
+    token = []
+    for char in str(pattern_str).strip():
+        if char in '(),':
+            if token:
+                tokens.append(''.join(token))
+                token = []
+            if char != ',':
+                tokens.append(char)
+            continue
+        if not char.isspace():
+            token.append(char)
+    if token:
+        tokens.append(''.join(token))
+    return tokens
+
+
+def _parse_pattern_tokens(tokens, position=0):
+    if position >= len(tokens) or tokens[position] != '(':
+        raise ValueError(f'Invalid pattern syntax at position {position}: {tokens}')
+
+    operator = tokens[position + 1]
+    position += 2
+
+    if operator == 'e':
+        if position >= len(tokens) or tokens[position] != ')':
+            raise ValueError(f'Entity pattern must close immediately: {tokens}')
+        return ('e',), position + 1
+
+    if operator in ['p', 'n']:
+        child, position = _parse_pattern_tokens(tokens, position)
+        if position >= len(tokens) or tokens[position] != ')':
+            raise ValueError(f'Unary pattern must close after child: {tokens}')
+        return (operator, child), position + 1
+
+    if operator in ['i', 'u']:
+        children = []
+        while position < len(tokens) and tokens[position] != ')':
+            child, position = _parse_pattern_tokens(tokens, position)
+            children.append(child)
+        if len(children) < 2:
+            raise ValueError(f'Operator "{operator}" requires at least two children: {tokens}')
+        if position >= len(tokens) or tokens[position] != ')':
+            raise ValueError(f'Set pattern must close after children: {tokens}')
+        return (operator, *children), position + 1
+
+    raise ValueError(f'Unsupported pattern operator: {operator}')
+
+
+def _render_pattern_surface(pattern_nested) -> str:
+    operator, *children = pattern_nested
+
+    if operator == 'e':
+        return '(-e)'
+    if operator == 'p':
+        return f'(-p {_render_pattern_surface(children[0])})'
+    if operator == 'n':
+        return f'(-n {_render_pattern_surface(children[0])})'
+    if operator in ['i', 'u']:
+        rendered_children = ' '.join(_render_pattern_surface(child) for child in children)
+        return f'(-{operator} {rendered_children})'
+    raise ValueError(f'Unsupported pattern operator: {operator}')
+
+
 def pattern_to_condition_text(pattern_str):
-    condition_text = pattern_str.replace(',', ' ')
-    condition_text = condition_text.replace('(', ' ( ')
-    condition_text = condition_text.replace(')', ' ) ')
-    return ' '.join(condition_text.split())
+    tokens = _tokenize_pattern(pattern_str)
+    if not tokens:
+        return ''
+    pattern_nested, position = _parse_pattern_tokens(tokens, 0)
+    if position != len(tokens):
+        raise ValueError(f'Unexpected trailing tokens in pattern string: {tokens[position:]}')
+    return _render_pattern_surface(pattern_nested)
 
 
 def extract_condition_metadata(query, pattern_str=None):

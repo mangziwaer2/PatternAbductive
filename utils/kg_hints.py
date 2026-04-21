@@ -7,8 +7,11 @@ from utils.textualization import (
     KG_HINTS_PREFIX,
     KG_HINT_FACT_PREFIX,
     entity_id_to_text,
+    format_surface_atom,
     normalize_symbol_name,
     observation_text_to_answer_ids,
+    tokenize_surface_text,
+    strip_surface_brackets,
 )
 
 
@@ -20,16 +23,16 @@ def _parse_condition_preferences(condition_text: str) -> dict:
     if not condition_text:
         return preferences
 
-    tokens = str(condition_text).split()
+    tokens = tokenize_surface_text(condition_text)
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token == CONDITION_LABELS['specific-entity'] and i + 1 < len(tokens):
-            preferences['specific_entity'] = tokens[i + 1]
+            preferences['specific_entity'] = strip_surface_brackets(tokens[i + 1])
             i += 2
             continue
         if token == CONDITION_LABELS['specific-relation'] and i + 1 < len(tokens):
-            preferences['specific_relation'] = tokens[i + 1]
+            preferences['specific_relation'] = strip_surface_brackets(tokens[i + 1])
             i += 2
             continue
         i += 1
@@ -45,7 +48,12 @@ def _resolve_graph_split(kg, graph_split: str) -> str:
 
 
 def _format_fact(subj_text: str, rel_text: str, obj_text: str) -> str:
-    return f'{KG_HINT_FACT_PREFIX} {subj_text} {rel_text} {obj_text}'
+    return ' '.join([
+        KG_HINT_FACT_PREFIX,
+        format_surface_atom(subj_text),
+        format_surface_atom(rel_text),
+        format_surface_atom(obj_text),
+    ])
 
 
 def build_kg_hints_text(
