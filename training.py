@@ -954,7 +954,7 @@ def fit(
                 )
                 msg = (
                     f'[valid-snapshot][epoch {epoch}/{nepoch}] '
-                    f'step {step}/{effective_total} '
+                    f'step {step}/{effective_total}'
                     f'train_window_avg={window_avg:.6f} '
                     f'valid_snapshot={snapshot_valid:.6f} '
                     f'valid_batches={args.intra_epoch_eval_batches if args.intra_epoch_eval_batches > 0 else "all"}'
@@ -1374,19 +1374,19 @@ def main():
         dataset_map_batch_size=args.dataset_map_batch_size,
     )
 
-    if args.exclude_condition_types:
-        for split in list(dataset_dict.keys()):
-            before_count = len(dataset_dict[split])
-            dataset_dict[split] = filter_dataset_by_excluded_condition_types(
-                dataset_dict[split],
-                excluded_condition_types=args.exclude_condition_types,
-            )
-            after_count = len(dataset_dict[split])
-            if after_count != before_count:
-                print(
-                    f'# Filtered split "{split}" by excluded condition types '
-                    f'{args.exclude_condition_types}: {before_count} -> {after_count}'
-                )
+    # if args.exclude_condition_types:
+    #     for split in list(dataset_dict.keys()):
+    #         before_count = len(dataset_dict[split])
+    #         dataset_dict[split] = filter_dataset_by_excluded_condition_types(
+    #             dataset_dict[split],
+    #             excluded_condition_types=args.exclude_condition_types,
+    #         )
+    #         after_count = len(dataset_dict[split])
+    #         if after_count != before_count:
+    #             print(
+    #                 f'# Filtered split "{split}" by excluded condition types '
+    #                 f'{args.exclude_condition_types}: {before_count} -> {after_count}'
+    #             )
 
     if args.mode == 'testing' and args.test_proportion < 1:
         nrows = dataset_dict[args.test_split].shape[0]
