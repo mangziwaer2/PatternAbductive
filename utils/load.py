@@ -41,15 +41,37 @@ def _ensure_rlmodel_unpickle_compat():
 def load_model(path,contents,return_huggingface_model=True,epoch=0,
                model=None, optimizer=None, scheduler=None):
     print(f'# Loading checkpoint (model) {path}')
-    if model is not None or optimizer is not None or scheduler is not None:
+    if optimizer is not None or scheduler is not None:
         print(f'# Error: cannot pass model, optimizer, scheduler with contents="{contents}"')
         exit()
 
     if contents=="model":
         checkpoint = torch.load(path,weights_only=False)
-        model = checkpoint['model']
-        optimizer = checkpoint.get('optimizer')
-        scheduler = checkpoint.get('scheduler')
+        if checkpoint.get('peft_checkpoint'):
+            if model is None:
+                raise ValueError(
+                    'This is a PEFT/LoRA checkpoint. Pass a base model to load_model(..., model=base_model), '
+                    'or resume training with --use_peft so training.py can create the base model first.'
+                )
+            try:
+                from peft import PeftModel
+            except ImportError as exc:
+                raise ImportError('peft is required to load this PEFT/LoRA checkpoint.') from exc
+            adapter_dir = checkpoint.get('peft_adapter_dir')
+            if adapter_dir is None:
+                raise ValueError(f'Missing peft_adapter_dir in checkpoint: {path}')
+            if not os.path.isabs(adapter_dir):
+                adapter_dir = os.path.join(os.path.dirname(path), adapter_dir)
+            print(f'# Loading PEFT adapter from {adapter_dir}')
+            model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
+            optimizer = None
+            scheduler = None
+        else:
+            if model is not None:
+                raise ValueError('A base model was passed, but the checkpoint is not a PEFT checkpoint.')
+            model = checkpoint['model']
+            optimizer = checkpoint.get('optimizer')
+            scheduler = checkpoint.get('scheduler')
     elif contents == 'rlmodel':
         _ensure_rlmodel_unpickle_compat()
         checkpoint = torch.load(path,weights_only=False)

@@ -112,28 +112,74 @@ The current minimal speed path is:
 7. Use --accelerate --mixed_precision fp16 or bf16 on cloud GPUs that support it.
 ```
 
-For Kaggle/cloud LoRA SFT, pass shell environment variables to `training_sft.sh` instead of adding uppercase flags to `training.py`:
+Kaggle notebook cells can call `training.py` directly. Use `--lora_modules_to_save none` and `--disable_text_extra_tokens` for lightweight LoRA; otherwise embedding/lm_head can dominate the trainable parameter count.
+
+Stage 1:
 
 ```bash
-MODELNAME=Qwen2.5-0.5B \
-DATA_ROOT=/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction_traced/ \
-BATCH_SIZE=4 \
-USE_PEFT=1 \
-LORA_R=8 \
-LORA_ALPHA=16 \
-LR=1e-4 \
-WARM_UP=100 \
-MIXED_PRECISION=fp16 \
-STAGE1_NEPOCH=1 \
-STAGE2_NEPOCH=1 \
-MAX_STAGE1_BATCHES=2000 \
-MAX_STAGE2_BATCHES=3000 \
-MAX_VALID_BATCHES=100 \
-TRAIN_LOG_EVERY=100 \
-bash training_sft.sh
+!python training.py \
+  --batch_size 4 \
+  --data_root "/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction_traced" \
+  --modelname "Qwen2.5-0.5B" \
+  --train_stage logic \
+  --override_nepoch 1 \
+  --max_train_rows 0 \
+  --max_valid_rows 0 \
+  --max_train_batches 2000 \
+  --max_valid_batches 100 \
+  --result_top_k 3 \
+  --accelerate \
+  --mixed_precision "fp16" \
+  --experiment_name stage1-logic \
+  --dataset_num_proc 4 \
+  --dataloader_num_workers 4 \
+  --dataloader_pin_memory true \
+  --dataloader_persistent_workers true \
+  --train_log_every 100 \
+  --save_frequency 1 \
+  --use_peft \
+  --lora_r 8 \
+  --lora_alpha 16 \
+  --lora_modules_to_save none \
+  --disable_text_extra_tokens \
+  --override_lr 1e-4 \
+  --override_warm_up 100
 ```
 
-`training.py` also accepts direct flags such as `--use_peft`, `--lora_r`, `--lora_alpha`, `--disable_text_extra_tokens`, `--override_lr`, and `--override_warm_up`.
+Stage 2:
+
+```bash
+!python training.py \
+  --batch_size 4 \
+  --data_root "/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction_traced" \
+  --modelname "Qwen2.5-0.5B" \
+  --train_stage stage2_loop \
+  --resume_epoch 1 \
+  --override_nepoch 2 \
+  --max_train_rows 0 \
+  --max_valid_rows 0 \
+  --max_train_batches 3000 \
+  --max_valid_batches 100 \
+  --result_top_k 3 \
+  --accelerate \
+  --mixed_precision "fp16" \
+  --experiment_name stage2-action-loop \
+  --dataset_num_proc 4 \
+  --dataloader_num_workers 4 \
+  --dataloader_pin_memory true \
+  --dataloader_persistent_workers true \
+  --train_log_every 100 \
+  --save_frequency 1 \
+  --use_peft \
+  --lora_r 8 \
+  --lora_alpha 16 \
+  --lora_modules_to_save none \
+  --disable_text_extra_tokens \
+  --override_lr 1e-4 \
+  --override_warm_up 100
+```
+
+Set `--max_train_batches 0` only when intentionally running the full split.
 
 ## Model Switch
 

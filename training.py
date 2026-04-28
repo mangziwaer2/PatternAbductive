@@ -8,6 +8,7 @@ import os
 import pathlib
 import platform
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -983,11 +984,23 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
     elif args.resume_epoch != 0:
         resume_path = get_checkpoint_path(args, args.resume_epoch, optimized=False)
         print(f'Loading model: {resume_path}')
+        base_model = None
+        if args.use_peft:
+            print('# Creating base model before loading PEFT adapter checkpoint.')
+            base_model = create_transformer(
+                ntoken=ntoken,
+                special_tokens=special_tokens,
+                model_name=model_name,
+                vocab_size=ntoken,
+                use_pretrained_weights=args.use_pretrained_text_model,
+                model_runtime_config=model_runtime_config,
+            )
         model, optimizer, scheduler, last_epoch, loss_log = load_model(
             resume_path,
             'model',
             return_huggingface_model=True,
             epoch=args.resume_epoch,
+            model=base_model,
         )
         model.model_name = model_name
         model.to(device)
@@ -1326,6 +1339,23 @@ def save_model(path, contents, model, optimizer=None, scheduler=None, epoch=None
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     if contents in {'model', 'rlmodel'}:
         print(f'# Saving checkpoint ({contents}) {path}')
+        if is_peft_model(model):
+            adapter_dir = f'{path}.adapter'
+            if os.path.exists(adapter_dir):
+                shutil.rmtree(adapter_dir)
+            model.save_pretrained(adapter_dir)
+            checkpoint = {
+                'peft_checkpoint': True,
+                'peft_adapter_dir': os.path.basename(adapter_dir),
+                'epoch': epoch,
+                'loss_log': loss_log,
+            }
+            if optimizer is not None and hasattr(optimizer, 'state_dict'):
+                checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+            if scheduler is not None and hasattr(scheduler, 'state_dict'):
+                checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+            torch.save(checkpoint, path)
+            return
         torch.save(
             {
                 'model': model,
