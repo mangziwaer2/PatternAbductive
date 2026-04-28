@@ -29,6 +29,28 @@ conda run -n patternabductive python scripts/hydrate_stage2_traces.py ^
   --overwrite
 ```
 
+Validate that each gold `logic_dsl` can explain its `OBS` on the matching KG split:
+
+```bash
+conda run -n patternabductive python scripts/validate_abduction_dataset.py ^
+  --data-root ./sampled_data_abduction_traced/ ^
+  --splits train,valid,test ^
+  --min-obs-recall 1.0 ^
+  --diagnose-splits train,valid,test ^
+  --overwrite
+```
+
+To write a filtered copy for reward-sensitive Stage 3 experiments, add an output root:
+
+```bash
+conda run -n patternabductive python scripts/validate_abduction_dataset.py ^
+  --data-root ./sampled_data_abduction_traced/ ^
+  --output-root ./sampled_data_abduction_checked/ ^
+  --splits train,valid,test ^
+  --min-obs-recall 1.0 ^
+  --overwrite
+```
+
 Or sample the target format directly:
 
 ```bash
@@ -98,6 +120,35 @@ conda run -n patternabductive python scripts/run_stage3_rollout_eval.py ^
   --max-rows 20
 ```
 
+## Checkpoint Inference
+
+Test a downloaded checkpoint locally with a single observation. Stage 1 checkpoints generate `PATTERN + DSL` directly:
+
+```bash
+conda run -n patternabductive python scripts/test_checkpoint_inference.py ^
+  --stage logic ^
+  --modelname Qwen2.5-0.5B ^
+  --checkpoint-path ./downloaded_ckpt/DBpedia50-default-8-1-text2text.pth ^
+  --observation "OBS [Augustin de Lespinasse]" ^
+  --disable-text-extra-tokens
+```
+
+Stage 2 checkpoints run the tool loop. The model emits `ACTION`, the script executes the KG tool, appends `RESULT`, and repeats until `DSL` or `--max-action-steps`:
+
+```bash
+conda run -n patternabductive python scripts/test_checkpoint_inference.py ^
+  --stage stage2_loop ^
+  --modelname Qwen2.5-0.5B ^
+  --checkpoint-path ./downloaded_ckpt/DBpedia50-default-8-2-text2text.pth ^
+  --observation "OBS [Augustin de Lespinasse]" ^
+  --graph-split train ^
+  --max-action-steps 3 ^
+  --disable-text-extra-tokens ^
+  --print-raw
+```
+
+For LoRA checkpoints, keep the `.pth.adapter/` directory next to the `.pth` file.
+
 ## Training Speed
 
 The current minimal speed path is:
@@ -155,6 +206,7 @@ Stage 2:
   --modelname "Qwen2.5-0.5B" \
   --train_stage stage2_loop \
   --resume_epoch 1 \
+  --checkpoint-path "/kaggle/input/stage1-logic-ckpt/DBpedia50-default-8-1-text2text.pth" \
   --override_nepoch 2 \
   --max_train_rows 0 \
   --max_valid_rows 0 \
@@ -178,6 +230,10 @@ Stage 2:
   --override_lr 1e-4 \
   --override_warm_up 100
 ```
+
+`--checkpoint-path` is optional when the checkpoint is already under `./ckpt/<modelname>/`.
+On Kaggle it is useful after downloading/uploading Stage 1 output as a dataset under `/kaggle/input`.
+For LoRA checkpoints, upload both the `.pth` file and the sibling `.pth.adapter/` directory.
 
 Set `--max_train_batches 0` only when intentionally running the full split.
 

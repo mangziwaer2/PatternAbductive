@@ -1,0 +1,2 @@
+lora r提升至16，alpha提升至32，提高对模型的改变能力
+读取权重文件 --checkpoint-path

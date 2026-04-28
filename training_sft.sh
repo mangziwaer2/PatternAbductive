@@ -10,6 +10,7 @@ MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 STAGE1_NEPOCH="${STAGE1_NEPOCH:-2}"
 STAGE2_NEPOCH="${STAGE2_NEPOCH:-3}"
 STAGE1_EPOCH="${STAGE1_EPOCH:-${STAGE1_NEPOCH}}"
+STAGE1_CHECKPOINT_PATH="${STAGE1_CHECKPOINT_PATH:-}"
 STAGE2_EXTRA_EPOCHS="${STAGE2_EXTRA_EPOCHS:-${STAGE2_NEPOCH}}"
 STAGE2_FINAL_EPOCH="${STAGE2_FINAL_EPOCH:-$((STAGE1_EPOCH + STAGE2_EXTRA_EPOCHS))}"
 STAGE2_EPOCH="${STAGE2_EPOCH:-${STAGE2_FINAL_EPOCH}}"
@@ -56,6 +57,11 @@ if [[ -n "${WARM_UP}" ]]; then
   TRAIN_OVERRIDE_ARGS+=(--override_warm_up "${WARM_UP}")
 fi
 
+STAGE2_RESUME_ARGS=()
+if [[ -n "${STAGE1_CHECKPOINT_PATH}" ]]; then
+  STAGE2_RESUME_ARGS+=(--checkpoint-path "${STAGE1_CHECKPOINT_PATH}")
+fi
+
 python training.py \
   --batch_size "${BATCH_SIZE}" \
   --data_root "${DATA_ROOT}" \
@@ -85,6 +91,7 @@ python training.py \
   --modelname "${MODELNAME}" \
   --train_stage stage2_loop \
   --resume_epoch "${STAGE1_EPOCH}" \
+  "${STAGE2_RESUME_ARGS[@]}" \
   --override_nepoch "${STAGE2_EPOCH}" \
   --max_train_rows "${MAX_TRAIN_ROWS}" \
   --max_valid_rows "${MAX_VALID_ROWS}" \

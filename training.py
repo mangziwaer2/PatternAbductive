@@ -964,6 +964,13 @@ def get_checkpoint_path(args, epoch, optimized=False):
     return candidates[0]
 
 
+def get_resume_checkpoint_path(args, epoch, optimized=False):
+    explicit_path = str(getattr(args, 'checkpoint_path', '') or '').strip()
+    if explicit_path:
+        return explicit_path
+    return get_checkpoint_path(args, epoch, optimized=optimized)
+
+
 def load_model_by_mode(args, device, model_name, ntoken, config_train, special_tokens, model_runtime_config=None):
     optimizer = None
     scheduler = None
@@ -971,7 +978,7 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
     loss_log = {'train': {}, 'valid': {}}
 
     if args.mode in ['optimizing', 'testing'] and args.rl_resume_epoch != 0:
-        resume_path = get_checkpoint_path(args, args.rl_resume_epoch, optimized=True)
+        resume_path = get_resume_checkpoint_path(args, args.rl_resume_epoch, optimized=True)
         print(f'Loading RL model: {resume_path}')
         model, optimizer, scheduler, last_epoch, loss_log = load_model(
             resume_path,
@@ -982,7 +989,7 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
         model.model_name = model_name
         model.to(device)
     elif args.resume_epoch != 0:
-        resume_path = get_checkpoint_path(args, args.resume_epoch, optimized=False)
+        resume_path = get_resume_checkpoint_path(args, args.resume_epoch, optimized=False)
         print(f'Loading model: {resume_path}')
         base_model = None
         if args.use_peft:
@@ -1386,6 +1393,12 @@ def my_parse_args():
     parser.add_argument('--scale', default='default')
 
     parser.add_argument('--checkpoint_root', default='./ckpt/')
+    parser.add_argument(
+        '--checkpoint-path',
+        dest='checkpoint_path',
+        default='',
+        help='Explicit checkpoint path for loading/resuming. Saving still uses --checkpoint_root.',
+    )
     parser.add_argument('-r', '--resume_epoch', type=int, default=0)
     parser.add_argument('--use_pretrained_text_model', action='store_true')
     parser.add_argument(

@@ -121,6 +121,30 @@ conda run -n patternabductive python scripts/hydrate_stage2_traces.py ^
 
 这样原始 JSONL 仍然只保存压缩轨迹，不保存展开后的 prefix 样本；但 Stage 2 dataloader 不需要在每次训练预处理时调用 KG，速度会明显更稳定。当前完整 DBpedia50 转换结果已经落在 `sampled_data_abduction_traced/DBpedia50`，三个 split 都有非空 `stage2_trace`。
 
+为了区分“KG 证据子图不完整”和“gold DSL 与当前 KG split 不一致”，新增一个数据校验脚本：
+
+```bash
+conda run -n patternabductive python scripts/validate_abduction_dataset.py ^
+  --data-root ./sampled_data_abduction_traced/ ^
+  --splits train,valid,test ^
+  --min-obs-recall 1.0 ^
+  --diagnose-splits train,valid,test ^
+  --overwrite
+```
+
+这里的 `OBS ⊆ execute(logic_dsl, split_KG)` 只检查 gold DSL 标签是否能在对应 KG split 上解释 observation。它不要求 `ACTION/RESULT` 能查出完整 hypothesis；ACTION 证据可以是不完整子图，模型仍然需要做溯因推断。
+
+如果要给 Stage 3 RL 使用更干净的数据，可以写出过滤后的目录：
+
+```bash
+conda run -n patternabductive python scripts/validate_abduction_dataset.py ^
+  --data-root ./sampled_data_abduction_traced/ ^
+  --output-root ./sampled_data_abduction_checked/ ^
+  --splits train,valid,test ^
+  --min-obs-recall 1.0 ^
+  --overwrite
+```
+
 ## 4. Stage 1：逻辑能力 SFT
 
 目标是让模型先学会 DSL 语法和 pattern 到 DSL 的关系。
@@ -129,11 +153,17 @@ conda run -n patternabductive python scripts/hydrate_stage2_traces.py ^
 
 ```text
 Source:
-OBS [a] [b]
+OBS [obs1] [obs2]
 
 Target:
-PATTERN AND(PROJ(ENT), PROJ(ENT)) DSL AND(PROJ([r1], ENT([a])), PROJ([r2], ENT([b])))
+PATTERN AND(PROJ(ENT), PROJ(ENT)) DSL AND(PROJ([+r1], ENT([h1])), PROJ([+r2], ENT([h2])))
 ```
+
+DSL 的方向约定：
+
+- `PROJ([+r], ENT([h]))` 表示从解释实体 `h` 出发，沿 KG 中的正向关系 `+r` 投影到答案集合。
+- `PROJ([-r], ENT([obs]))` 表示从观测实体 `obs` 出发，沿反向关系 `-r` 反查可能来源。
+- 因此医学例子里如果 KG 边是 `流感 --+症状--> 发烧`，那么“流感解释发烧/咳嗽/乏力”的 DSL 应写成 `PROJ([+症状], ENT([流感]))`，而不是 `PROJ([+症状], ENT([发烧]))`。
 
 训练命令：
 

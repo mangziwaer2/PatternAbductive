@@ -218,6 +218,8 @@ sampled_data_backup/
 sampled_data_smoke/
 sampled_data_text_smoke/
 sampled_data_mini_exp*/
+sampled_data_resampled*/
+sampled_data_abduction_resampled*/
 
 # Generated dataset outputs
 sampled_data/*/
