@@ -19,6 +19,18 @@ from utils.load import load_kg, load_model, load_yaml
 from utils.tool_loop import extract_action_text, extract_dsl_text, run_action_tool_call
 
 
+def checkpoint_needs_base_model(checkpoint_path):
+    if not checkpoint_path:
+        return False
+    if os.path.isdir(checkpoint_path):
+        return os.path.exists(os.path.join(checkpoint_path, 'adapter_config.json'))
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    except Exception:
+        return False
+    return bool(isinstance(checkpoint, dict) and checkpoint.get('peft_checkpoint'))
+
+
 def resolve_checkpoint_path(args):
     if args.checkpoint_path:
         return args.checkpoint_path
@@ -47,11 +59,27 @@ def load_stage2_model(args, tokenizer, ntoken, device):
     model_runtime_config = resolve_model_runtime_config(args.modelname, config_model)
     checkpoint_path = resolve_checkpoint_path(args)
     if checkpoint_path:
+        base_model = None
+        if checkpoint_needs_base_model(checkpoint_path):
+            special_tokens = {
+                'PAD': tokenizer.pad_token_id,
+                'START': tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
+                'END': tokenizer.eos_token_id,
+            }
+            base_model = create_transformer(
+                ntoken=ntoken,
+                special_tokens=special_tokens,
+                model_name=args.modelname,
+                vocab_size=ntoken,
+                use_pretrained_weights=args.use_pretrained_text_model,
+                model_runtime_config=model_runtime_config,
+            )
         model, _, _, _, _ = load_model(
             checkpoint_path,
             'model',
             return_huggingface_model=True,
             epoch=args.resume_epoch,
+            model=base_model,
         )
         model.to(device)
         model.eval()

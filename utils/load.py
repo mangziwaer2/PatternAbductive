@@ -38,6 +38,36 @@ def _ensure_rlmodel_unpickle_compat():
     model_class.dummy_add_model_tags = dummy_add_model_tags
 
 
+def _find_checkpoint_file_in_dir(path):
+    path_obj = Path(path)
+    candidates = sorted(path_obj.glob('*text2text.pth'))
+    if not candidates:
+        candidates = sorted(path_obj.glob('*.pth'))
+    if len(candidates) == 1:
+        return str(candidates[0])
+    if len(candidates) > 1:
+        raise ValueError(
+            f'Checkpoint path is a directory with multiple .pth files: {path}. '
+            f'Pass one file explicitly. Candidates: {[str(candidate) for candidate in candidates]}'
+        )
+    return ''
+
+
+def _load_peft_adapter_dir(adapter_dir, model):
+    if model is None:
+        raise ValueError(
+            'Checkpoint path points to a PEFT/LoRA adapter directory. '
+            'Pass a base model to load_model(..., model=base_model), '
+            'or resume training with --use_peft so training.py can create the base model first.'
+        )
+    try:
+        from peft import PeftModel
+    except ImportError as exc:
+        raise ImportError('peft is required to load this PEFT/LoRA checkpoint.') from exc
+    print(f'# Loading PEFT adapter from {adapter_dir}')
+    return PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
+
+
 def load_model(path,contents,return_huggingface_model=True,epoch=0,
                model=None, optimizer=None, scheduler=None):
     print(f'# Loading checkpoint (model) {path}')
@@ -46,32 +76,47 @@ def load_model(path,contents,return_huggingface_model=True,epoch=0,
         exit()
 
     if contents=="model":
-        checkpoint = torch.load(path,weights_only=False)
-        if checkpoint.get('peft_checkpoint'):
-            if model is None:
-                raise ValueError(
-                    'This is a PEFT/LoRA checkpoint. Pass a base model to load_model(..., model=base_model), '
-                    'or resume training with --use_peft so training.py can create the base model first.'
+        if os.path.isdir(path):
+            adapter_config_path = os.path.join(path, 'adapter_config.json')
+            if os.path.exists(adapter_config_path):
+                model = _load_peft_adapter_dir(path, model)
+                optimizer = None
+                scheduler = None
+                checkpoint = {
+                    'epoch': epoch,
+                    'loss_log': {'train': {}, 'valid': {}},
+                }
+            else:
+                checkpoint_file = _find_checkpoint_file_in_dir(path)
+                if not checkpoint_file:
+                    raise IsADirectoryError(
+                        f'Checkpoint path is a directory but contains neither adapter_config.json nor a single .pth file: {path}'
+                    )
+                print(f'# Resolved checkpoint directory to file: {checkpoint_file}')
+                return load_model(
+                    checkpoint_file,
+                    contents,
+                    return_huggingface_model=return_huggingface_model,
+                    epoch=epoch,
+                    model=model,
                 )
-            try:
-                from peft import PeftModel
-            except ImportError as exc:
-                raise ImportError('peft is required to load this PEFT/LoRA checkpoint.') from exc
-            adapter_dir = checkpoint.get('peft_adapter_dir')
-            if adapter_dir is None:
-                raise ValueError(f'Missing peft_adapter_dir in checkpoint: {path}')
-            if not os.path.isabs(adapter_dir):
-                adapter_dir = os.path.join(os.path.dirname(path), adapter_dir)
-            print(f'# Loading PEFT adapter from {adapter_dir}')
-            model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
-            optimizer = None
-            scheduler = None
         else:
-            if model is not None:
-                raise ValueError('A base model was passed, but the checkpoint is not a PEFT checkpoint.')
-            model = checkpoint['model']
-            optimizer = checkpoint.get('optimizer')
-            scheduler = checkpoint.get('scheduler')
+            checkpoint = torch.load(path,weights_only=False)
+            if checkpoint.get('peft_checkpoint'):
+                adapter_dir = checkpoint.get('peft_adapter_dir')
+                if adapter_dir is None:
+                    raise ValueError(f'Missing peft_adapter_dir in checkpoint: {path}')
+                if not os.path.isabs(adapter_dir):
+                    adapter_dir = os.path.join(os.path.dirname(path), adapter_dir)
+                model = _load_peft_adapter_dir(adapter_dir, model)
+                optimizer = None
+                scheduler = None
+            else:
+                if model is not None:
+                    raise ValueError('A base model was passed, but the checkpoint is not a PEFT checkpoint.')
+                model = checkpoint['model']
+                optimizer = checkpoint.get('optimizer')
+                scheduler = checkpoint.get('scheduler')
     elif contents == 'rlmodel':
         _ensure_rlmodel_unpickle_compat()
         checkpoint = torch.load(path,weights_only=False)

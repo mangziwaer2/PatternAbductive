@@ -30,6 +30,10 @@ def normalize_observation(observation: str) -> str:
 def load_checkpoint_metadata(checkpoint_path: str) -> dict:
     if not checkpoint_path:
         return {}
+    if os.path.isdir(checkpoint_path):
+        if os.path.exists(os.path.join(checkpoint_path, 'adapter_config.json')):
+            return {'peft_checkpoint': True, 'peft_adapter_dir': checkpoint_path}
+        return {}
     try:
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     except TypeError:

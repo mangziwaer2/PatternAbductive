@@ -18,7 +18,7 @@ import torch
 
 from model.tokenizer import create_text_tokenizer, decode_text_token_ids, get_text_extra_tokens
 from model.transformer import create_transformer, get_tokenizer_path, resolve_model_runtime_config
-from scripts.run_stage2_tool_loop import resolve_checkpoint_path
+from scripts.run_stage2_tool_loop import checkpoint_needs_base_model, resolve_checkpoint_path
 from utils.load import load_kg, load_model, load_yaml, resolve_sampled_dataset_path
 from utils.rl_rewards import score_rollout_trajectory
 from utils.tool_loop import extract_action_text, extract_dsl_text, run_action_tool_call
@@ -39,11 +39,27 @@ def iter_records(path, max_rows=0):
 def load_policy_model(args, tokenizer, ntoken, device, model_runtime_config):
     checkpoint_path = resolve_checkpoint_path(args)
     if checkpoint_path:
+        base_model = None
+        if checkpoint_needs_base_model(checkpoint_path):
+            special_tokens = {
+                'PAD': tokenizer.pad_token_id,
+                'START': tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
+                'END': tokenizer.eos_token_id,
+            }
+            base_model = create_transformer(
+                ntoken=ntoken,
+                special_tokens=special_tokens,
+                model_name=args.modelname,
+                vocab_size=ntoken,
+                use_pretrained_weights=args.use_pretrained_text_model,
+                model_runtime_config=model_runtime_config,
+            )
         model, _, _, _, _ = load_model(
             checkpoint_path,
             'model',
             return_huggingface_model=True,
             epoch=args.resume_epoch,
+            model=base_model,
         )
         model.to(device)
         return model
