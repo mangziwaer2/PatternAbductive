@@ -53,6 +53,71 @@ def _find_checkpoint_file_in_dir(path):
     return ''
 
 
+def _has_adapter_config(path):
+    return bool(path) and os.path.exists(os.path.join(str(path), 'adapter_config.json'))
+
+
+def _adapter_dir_candidates(checkpoint_path, recorded_adapter_dir):
+    checkpoint_path = os.path.abspath(str(checkpoint_path))
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    checkpoint_name = os.path.basename(checkpoint_path)
+    checkpoint_stem = Path(checkpoint_path).stem
+    candidates = []
+
+    def add(candidate):
+        if not candidate:
+            return
+        candidate = os.path.abspath(str(candidate))
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if recorded_adapter_dir:
+        if os.path.isabs(recorded_adapter_dir):
+            add(recorded_adapter_dir)
+        else:
+            add(os.path.join(checkpoint_dir, recorded_adapter_dir))
+
+    add(f'{checkpoint_path}.adapter')
+    add(os.path.join(checkpoint_dir, f'{checkpoint_name}.adapter'))
+    add(os.path.join(checkpoint_dir, f'{checkpoint_stem}.adapter'))
+
+    if checkpoint_stem.endswith('-text2text'):
+        add(os.path.join(checkpoint_dir, checkpoint_stem[:-len('-text2text')]))
+    if checkpoint_name.endswith('-text2text.pth'):
+        add(os.path.join(checkpoint_dir, checkpoint_name[:-len('-text2text.pth')]))
+    if checkpoint_name.endswith('.pth'):
+        add(os.path.join(checkpoint_dir, checkpoint_name[:-len('.pth')]))
+
+    add(checkpoint_dir)
+
+    try:
+        child_adapter_dirs = [
+            str(child)
+            for child in Path(checkpoint_dir).iterdir()
+            if child.is_dir() and _has_adapter_config(child)
+        ]
+    except OSError:
+        child_adapter_dirs = []
+    for child in sorted(child_adapter_dirs):
+        add(child)
+
+    return candidates
+
+
+def _resolve_peft_adapter_dir(checkpoint_path, recorded_adapter_dir):
+    candidates = _adapter_dir_candidates(checkpoint_path, recorded_adapter_dir)
+    valid_candidates = [candidate for candidate in candidates if _has_adapter_config(candidate)]
+    if valid_candidates:
+        if len(valid_candidates) > 1:
+            print(f'# Multiple PEFT adapter candidates found; using first: {valid_candidates[0]}')
+        return valid_candidates[0]
+    raise FileNotFoundError(
+        'Cannot find adapter_config.json for PEFT checkpoint. '
+        f'checkpoint={checkpoint_path}, recorded_adapter_dir={recorded_adapter_dir}, '
+        f'checked={candidates}'
+    )
+
+
 def _load_peft_adapter_dir(adapter_dir, model):
     if model is None:
         raise ValueError(
@@ -106,8 +171,7 @@ def load_model(path,contents,return_huggingface_model=True,epoch=0,
                 adapter_dir = checkpoint.get('peft_adapter_dir')
                 if adapter_dir is None:
                     raise ValueError(f'Missing peft_adapter_dir in checkpoint: {path}')
-                if not os.path.isabs(adapter_dir):
-                    adapter_dir = os.path.join(os.path.dirname(path), adapter_dir)
+                adapter_dir = _resolve_peft_adapter_dir(path, adapter_dir)
                 model = _load_peft_adapter_dir(adapter_dir, model)
                 optimizer = None
                 scheduler = None
