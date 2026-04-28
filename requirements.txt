@@ -1,0 +1,10 @@
+transformers==4.46.3
+datasets
+trl
+accelerate
+peft
+pykeen
+pandas
+tqdm
+pyyaml
+smatch

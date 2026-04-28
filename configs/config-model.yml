@@ -1,0 +1,40 @@
+default:
+  architecture: gpt2
+  pretrained_model_path: gpt2
+  tokenizer_path: gpt2
+  use_pretrained_weights: false
+  trust_remote_code: false
+  config_overrides:
+    n_layer: 6
+
+GPT2_6_act_nt:
+  architecture: gpt2
+  pretrained_model_path: gpt2
+  tokenizer_path: gpt2
+  use_pretrained_weights: false
+  trust_remote_code: false
+  config_overrides:
+    n_layer: 6
+
+# Cloud training examples. Use them by setting --modelname to one of these keys.
+# The model files will be resolved by HuggingFace Transformers on the cloud machine.
+Qwen2.5-0.5B:
+  architecture: auto_causal_lm
+  pretrained_model_path: Qwen/Qwen2.5-0.5B
+  tokenizer_path: Qwen/Qwen2.5-0.5B
+  use_pretrained_weights: true
+  trust_remote_code: false
+
+Qwen2.5-1.5B:
+  architecture: auto_causal_lm
+  pretrained_model_path: Qwen/Qwen2.5-1.5B
+  tokenizer_path: Qwen/Qwen2.5-1.5B
+  use_pretrained_weights: true
+  trust_remote_code: false
+
+Llama-3.2-1B:
+  architecture: auto_causal_lm
+  pretrained_model_path: meta-llama/Llama-3.2-1B
+  tokenizer_path: meta-llama/Llama-3.2-1B
+  use_pretrained_weights: true
+  trust_remote_code: false

@@ -1,10 +1,10 @@
 from utils.condition import CONDITION_LABELS, extract_condition_metadata
 from utils.evaluation import get_smatch_score
+from utils.logic_dsl import logic_text_to_query_wordlist
 from utils.parsing import qry_wordlist_2_graph
 from utils.textualization import (
     entity_text_to_id,
     observation_text_to_answer_ids,
-    query_text_to_wordlist,
     relation_text_to_id,
     render_surface_tokens,
     tokenize_surface_text,
@@ -107,8 +107,8 @@ def score_text_query_prediction(
     score = build_text_score_zero()
 
     try:
-        pred_wordlist = query_text_to_wordlist(completion, kg)
-        target_wordlist = query_text_to_wordlist(target, kg)
+        pred_wordlist = logic_text_to_query_wordlist(completion, kg)
+        target_wordlist = logic_text_to_query_wordlist(target, kg)
     except Exception:
         return score
 

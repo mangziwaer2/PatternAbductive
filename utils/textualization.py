@@ -5,8 +5,6 @@ from utils.parsing import qry_wordlist_2_nestedlist
 
 
 OBS_PREFIX = 'OBS'
-KG_HINTS_PREFIX = 'KG_HINTS'
-KG_HINT_FACT_PREFIX = 'FACT'
 TEXT_CONDITION_FIELD = 'condition_text_textual'
 GRAPH_HYPOTHESIS_FIELD = 'hypothesis_graph_text'
 
@@ -15,7 +13,6 @@ SURFACE_HYPOTHESIS_STRUCTURE_TOKENS = ['(', ')', '[', ']', '-p', '-i', '-u', '-n
 HYPOTHESIS_STRUCTURE_TOKENS = SURFACE_HYPOTHESIS_STRUCTURE_TOKENS
 
 GRAPH_TEXT_TOKENS = ['Conclusion', 'AND', 'OR', 'NOT', 'PROJECTION', 'ENTITY', 'leads', 'to']
-KG_HINT_TOKENS = [KG_HINTS_PREFIX, KG_HINT_FACT_PREFIX]
 RELATION_DIRECTION_PREFIXES = ('+', '-')
 QUERY_OPERATOR_TEXT_TO_SYMBOL = {
     '-p': 'p',
@@ -27,7 +24,6 @@ QUERY_OPERATOR_TEXT_TO_SYMBOL = {
 QUERY_OPERATOR_SYMBOL_TO_TEXT = {value: key for key, value in QUERY_OPERATOR_TEXT_TO_SYMBOL.items()}
 CONTROL_TEXT_TOKENS = [
     OBS_PREFIX,
-    *KG_HINT_TOKENS,
     'COND',
     *CONDITION_LABELS.values(),
     *GRAPH_TEXT_TOKENS,
@@ -106,6 +102,10 @@ def render_surface_tokens(tokens: list[str]) -> str:
 
 
 def build_name_maps(kg):
+    cached_maps = getattr(kg, '_surface_name_maps_cache', None)
+    if cached_maps is not None:
+        return cached_maps
+
     ent_name_to_id = {}
     rel_name_to_id = {}
 
@@ -115,7 +115,9 @@ def build_name_maps(kg):
     for rel_id, rel_name in kg.rel_id2name.items():
         rel_name_to_id[canonical_surface_key(rel_name)] = rel_id
 
-    return ent_name_to_id, rel_name_to_id
+    cached_maps = (ent_name_to_id, rel_name_to_id)
+    setattr(kg, '_surface_name_maps_cache', cached_maps)
+    return cached_maps
 
 
 def entity_id_to_text(entity_id: int, kg) -> str:

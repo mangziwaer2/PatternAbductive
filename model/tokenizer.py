@@ -1,18 +1,27 @@
 import torch
-from transformers import AddedToken, GPT2TokenizerFast
+from transformers import AddedToken, AutoTokenizer
 
 from utils.condition import CONDITION_TOKENS
-from utils.kg_hints import build_kg_hints_text
+from utils.action_supervision import ACTION_CONTROL_TOKENS
+from utils.evidence import EVIDENCE_CONTROL_TOKENS
+from utils.logic_dsl import DSL_CONTROL_TOKENS
 from utils.textualization import (
     GRAPH_TEXT_TOKENS,
     HYPOTHESIS_STRUCTURE_TOKENS,
-    KG_HINT_TOKENS,
     is_relation_text_token,
 )
 
 
 DEFAULT_CONDITION_TOKENS = CONDITION_TOKENS
-TEXT_EXTRA_TOKENS = ['OBS', *KG_HINT_TOKENS, *DEFAULT_CONDITION_TOKENS, *HYPOTHESIS_STRUCTURE_TOKENS]
+TEXT_EXTRA_TOKENS = [
+    'OBS',
+    *DEFAULT_CONDITION_TOKENS,
+    *HYPOTHESIS_STRUCTURE_TOKENS,
+    *DSL_CONTROL_TOKENS,
+    *ACTION_CONTROL_TOKENS,
+    *EVIDENCE_CONTROL_TOKENS,
+    'NO_CANDIDATES',
+]
 
 
 def get_text_extra_tokens(include_graph_tokens: bool = False):
@@ -22,15 +31,24 @@ def get_text_extra_tokens(include_graph_tokens: bool = False):
     return extra_tokens
 
 
-def create_text_tokenizer(pretrained_model_path: str, extra_tokens=None, closed_text_tokens=None):
+def create_text_tokenizer(
+        pretrained_model_path: str,
+        extra_tokens=None,
+        closed_text_tokens=None,
+        trust_remote_code: bool = False):
     if extra_tokens is None:
         extra_tokens = get_text_extra_tokens(include_graph_tokens=False)
 
-    tokenizer = GPT2TokenizerFast.from_pretrained(pretrained_model_path)
-    tokenizer.add_special_tokens({
-        'pad_token': '<|pad|>',
-        'sep_token': 'SEP',
-    })
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_path,
+        use_fast=True,
+        trust_remote_code=trust_remote_code,
+    )
+    special_tokens = {}
+    if tokenizer.pad_token is None:
+        special_tokens['pad_token'] = '<|pad|>'
+    special_tokens['sep_token'] = 'SEP'
+    tokenizer.add_special_tokens(special_tokens)
 
     seen_tokens = set()
     tokens_to_add = []
@@ -74,23 +92,28 @@ def decode_text_token_ids(tokenizer, token_ids, preserve_whitespace: bool = Fals
     return ' '.join(decoded.split())
 
 
-def build_conditioned_source(source, condition_text=None, kg_hints_text=None):
+def build_conditioned_source(source, condition_text=None):
     if condition_text is None:
         condition_text = [''] * len(source)
-    if kg_hints_text is None:
-        kg_hints_text = [''] * len(source)
 
     merged_source = []
-    for src, cond, hints in zip(source, condition_text, kg_hints_text):
+    for src, cond in zip(source, condition_text):
         cond = str(cond).strip()
-        hints = str(hints).strip()
         parts = [src]
         if cond:
             parts.extend(['SEP', cond])
-        if hints:
-            parts.extend(['SEP', hints])
         merged_source.append(' '.join(parts))
     return merged_source
+
+
+def append_eos_to_targets(target, tokenizer):
+    eos_token = tokenizer.eos_token
+    if eos_token is None:
+        return target
+    return [
+        text if str(text).rstrip().endswith(eos_token) else f'{text} {eos_token}'
+        for text in target
+    ]
 
 
 def extract_text_sample_to_device(
@@ -99,17 +122,17 @@ def extract_text_sample_to_device(
         tokenizer,
         src_len,
         tgt_len,
-        is_gen: bool,
-        kg_hints_text=None):
+        is_gen: bool):
     source = sample['source']
     target = sample['target']
     pattern_id = sample['pattern_id']
     condition_text = sample.get('condition_text', [''] * len(source))
-    merged_source = build_conditioned_source(source, condition_text, kg_hints_text=kg_hints_text)
+    merged_source = build_conditioned_source(source, condition_text)
+    target_with_eos = append_eos_to_targets(target, tokenizer)
 
     source_target_tokenized = tokenizer(
         merged_source,
-        target,
+        target_with_eos,
         padding='longest',
         return_tensors='pt',
     ).to(device)
@@ -145,24 +168,15 @@ def extract_text_sample_to_device(
     return source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, condition_text
 
 
-def source_to_prompt(example, args=None, kg=None, kg_hint_split: str = 'train'):
+def source_to_prompt(example):
     condition_text = example.get('condition_text', '')
-    kg_hints_text = example.get('kg_hints_text', '')
-    if not kg_hints_text and args is not None and getattr(args, 'use_kg_hints', False) and kg is not None:
-        kg_hints_text = build_kg_hints_text(
-            observation_text=example['source'],
-            kg=kg,
-            condition_text=condition_text,
-            graph_split=kg_hint_split,
-            max_facts=getattr(args, 'kg_hints_max_facts', 8),
-        )
-    prompt = build_conditioned_source([example['source']], [condition_text], [kg_hints_text])[0]
+    prompt = build_conditioned_source([example['source']], [condition_text])[0]
     enriched = dict(example)
     enriched['prompt'] = prompt
     return enriched
 
 
-def new_extract_sample_to_device(device, sample, tokenizer, src_len, tgt_len, is_gen: bool, kg_hints_text=None):
+def new_extract_sample_to_device(device, sample, tokenizer, src_len, tgt_len, is_gen: bool):
     return extract_text_sample_to_device(
         device=device,
         sample=sample,
@@ -170,7 +184,6 @@ def new_extract_sample_to_device(device, sample, tokenizer, src_len, tgt_len, is
         src_len=src_len,
         tgt_len=tgt_len,
         is_gen=is_gen,
-        kg_hints_text=kg_hints_text,
     )
 
 
@@ -181,8 +194,7 @@ def new_extract_sample_to_device_condition(
         src_len,
         tgt_len,
         is_gen: bool,
-        condition_key: str = 'condition_text',
-        kg_hints_text=None):
+        condition_key: str = 'condition_text'):
     if condition_key in sample and condition_key != 'condition_text':
         sample = dict(sample)
         sample['condition_text'] = sample[condition_key]
@@ -193,11 +205,10 @@ def new_extract_sample_to_device_condition(
         src_len=src_len,
         tgt_len=tgt_len,
         is_gen=is_gen,
-        kg_hints_text=kg_hints_text,
     )
 
 
-def new_extract_sample_to_device_pattern(device, sample, tokenizer, src_len, tgt_len, is_gen: bool, kg_hints_text=None):
+def new_extract_sample_to_device_pattern(device, sample, tokenizer, src_len, tgt_len, is_gen: bool):
     return extract_text_sample_to_device(
         device=device,
         sample=sample,
@@ -205,5 +216,4 @@ def new_extract_sample_to_device_pattern(device, sample, tokenizer, src_len, tgt
         src_len=src_len,
         tgt_len=tgt_len,
         is_gen=is_gen,
-        kg_hints_text=kg_hints_text,
     )

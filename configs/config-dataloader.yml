@@ -16,5 +16,5 @@ ans_len: 32
 qry_len: 128
 act_len: 32
 act_max_var: 16
-text_obs_len: 128
+text_obs_len: 768
 text_hyp_len: 256

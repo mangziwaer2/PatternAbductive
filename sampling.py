@@ -104,8 +104,7 @@ def build_sample_records(args, mode, answers_from, query, pattern_str, base_samp
             kg=kg,
             sample_id=(int(base_sample_id) * 1000) + record_index,
             graph_split=mode,
-            include_kg_hints=True,
-            kg_hints_max_facts=args.kg_hints_max_facts,
+            result_top_k=args.result_top_k,
         )
         for record_index, record in enumerate(expanded_records)
     ]
@@ -148,7 +147,7 @@ def create_initial_state(args, patterns_pool):
             split: {
                 'next_index': 0,
                 'rows_written': 0,
-                'completed': False,
+                'completed': len(patterns_pool[split]) == 0,
                 'total_patterns': len(patterns_pool[split]),
             }
             for split in ['train', 'valid', 'test']
@@ -205,19 +204,18 @@ def write_stats(output_dir, kg):
 def write_text_format_manifest(output_dir, args):
     manifest_path = os.path.join(output_dir, 'text_format_manifest.json')
     manifest = {
-        'format_version': 'surface_text_minimal_v1',
+        'format_version': 'abduction_sft_v1',
         'dataname': args.dataname,
         'data_root': args.data_root,
         'generated_by': 'sampling.py',
         'changes': [
-            'Sampling writes minimal text-only rows directly.',
-            'Entity and relation names use surface forms with spaces instead of underscores.',
-            'Logical operators use surface tokens like (-p), (-e), (-i), (-u), (-n).',
-            'Entities and relations are wrapped by square brackets for parse-safe text-to-text training.',
-            'KG hints are precomputed into kg_hints_text at sampling time.',
+            'Sampling writes compact abduction SFT rows directly.',
+            'Raw rows keep only pattern_str, observation_text, logic_dsl, and stage2_trace.',
+            'stage2_trace stores one-hop ACTION/RESULT events; dataloader expands it into prefix-to-next-step SFT samples.',
+            'ACTION no longer exposes oracle depth fields; multi-hop supervision is represented by repeated one-hop ACTION calls.',
         ],
         'exclude_condition_types': args.exclude_condition_types,
-        'kg_hints_max_facts': args.kg_hints_max_facts,
+        'result_top_k': args.result_top_k,
         'train_samples_per_pattern': args.train_samples_per_pattern,
         'valid_samples_per_pattern': args.valid_samples_per_pattern,
         'test_samples_per_pattern': args.test_samples_per_pattern,
@@ -305,13 +303,15 @@ def sample_mode(args, mode, graph_samplers, patterns_pool, rng, kg, state):
 def my_parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--pattern_path', default='./metadata/pattern_filtered.csv')
-    parser.add_argument('-a', '--max-answer-size', type=int, default=32)
+    parser.add_argument('-a', '--max-answer-size', type=int, default=8)
     parser.add_argument('-d', '--dataname', default='DBpedia50')
-    parser.add_argument('--data_root', default='./sampled_data_surface/')
+    parser.add_argument('--data_root', default='./sampled_data_abduction/')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--condition-samples-per-query', type=int, default=6)
+    parser.add_argument('--condition-samples-per-query', type=int, default=0)
     parser.add_argument('--max-condition-arity', type=int, default=3)
-    parser.add_argument('--include-unconditional', action='store_true')
+    parser.add_argument('--include-unconditional', dest='include_unconditional', action='store_true')
+    parser.add_argument('--no-unconditional', dest='include_unconditional', action='store_false')
+    parser.set_defaults(include_unconditional=True)
     parser.add_argument(
         '--train-samples-per-pattern',
         type=int,
@@ -338,7 +338,8 @@ def my_parse_args():
     )
     parser.add_argument('--flush-size', type=int, default=5000)
     parser.add_argument('--checkpoint-frequency', type=int, default=1000)
-    parser.add_argument('--kg-hints-max-facts', type=int, default=8)
+    parser.add_argument('--result-top-k', type=int, default=3)
+    parser.add_argument('--splits', default='train,valid,test')
     parser.add_argument('--restart', action='store_true')
     parser.add_argument(
         '--exclude-condition-types',
@@ -371,14 +372,19 @@ def main():
     }
     print(num_samples_perpattern)
 
+    selected_splits = [split.strip() for split in args.splits.split(',') if split.strip()]
+    invalid_splits = [split for split in selected_splits if split not in {'train', 'valid', 'test'}]
+    if invalid_splits:
+        raise ValueError(f'Unsupported splits: {invalid_splits}')
+
     patterns_pool = {'train': [], 'valid': [], 'test': []}
     for _, pattern_str in pattern_table['pattern_str'].items():
-        for split in ['train', 'valid', 'test']:
+        for split in selected_splits:
             patterns_pool[split].extend([pattern_str] * num_samples_perpattern[split])
 
     state = load_or_create_state(args, patterns_pool)
     split_offsets = {'train': 0, 'valid': 10_000, 'test': 20_000}
-    for split in ['train', 'valid', 'test']:
+    for split in selected_splits:
         split_rng = random.Random(args.seed + split_offsets[split])
         split_rng.shuffle(patterns_pool[split])
         if args.max_patterns_per_split > 0:

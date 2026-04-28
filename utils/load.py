@@ -48,15 +48,15 @@ def load_model(path,contents,return_huggingface_model=True,epoch=0,
     if contents=="model":
         checkpoint = torch.load(path,weights_only=False)
         model = checkpoint['model']
-        optimizer = checkpoint['optimizer']
-        scheduler = checkpoint['scheduler']
+        optimizer = checkpoint.get('optimizer')
+        scheduler = checkpoint.get('scheduler')
     elif contents == 'rlmodel':
         _ensure_rlmodel_unpickle_compat()
         checkpoint = torch.load(path,weights_only=False)
         model = checkpoint['model']
         model.warnings_issued = {}
-        optimizer = checkpoint['optimizer']
-        scheduler = checkpoint['scheduler']
+        optimizer = checkpoint.get('optimizer')
+        scheduler = checkpoint.get('scheduler')
     else:
         print(f'# Error: contents "{contents}" not supported')
         exit()
@@ -203,23 +203,43 @@ def load_jsonl_as_hf_dataset(data_path, split: str, dataset_cache_root=None, dat
         dataname=dataname,
     )
     cache_state_path = os.path.join(dataset_path, 'state.json')
-    if os.path.exists(cache_state_path) and os.path.getmtime(cache_state_path) >= os.path.getmtime(data_path):
-        return load_from_disk(dataset_path)
+    source_stat = os.stat(data_path)
+    source_meta = {
+        'data_path': os.path.abspath(data_path),
+        'mtime_ns': int(source_stat.st_mtime_ns),
+        'size': int(source_stat.st_size),
+        'max_rows': int(max_rows or 0),
+    }
+    source_meta_path = os.path.join(dataset_path, 'source_meta.json')
+    if os.path.exists(cache_state_path) and os.path.exists(source_meta_path):
+        with open(source_meta_path, 'r', encoding='utf-8') as input_file:
+            cached_meta = json.load(input_file)
+        if cached_meta == source_meta:
+            return load_from_disk(dataset_path)
 
     cache_dir = resolve_dataset_cache_path(dataname or 'default', dataset_cache_root=dataset_cache_root)
+    generator_cache_dir = os.path.join(
+        cache_dir,
+        'raw_generator',
+        sanitize_cache_component(Path(data_path).stem),
+        sanitize_cache_component(split),
+        sanitize_cache_component(f'{max_rows or 0}-{source_stat.st_mtime_ns}-{source_stat.st_size}'),
+    )
     dataset = HFDataset.from_generator(
         iter_jsonl_records,
         gen_kwargs={
             'data_path': data_path,
             'max_rows': max_rows,
         },
-        cache_dir=cache_dir,
+        cache_dir=generator_cache_dir,
         keep_in_memory=False,
     )
     if os.path.exists(dataset_path):
         shutil.rmtree(dataset_path)
     Path(dataset_path).parent.mkdir(parents=True, exist_ok=True)
     dataset.save_to_disk(dataset_path)
+    with open(source_meta_path, 'w', encoding='utf-8') as output_file:
+        json.dump(source_meta, output_file, ensure_ascii=False, indent=2)
     return dataset
 
 
