@@ -112,6 +112,29 @@ The current minimal speed path is:
 7. Use --accelerate --mixed_precision fp16 or bf16 on cloud GPUs that support it.
 ```
 
+For Kaggle/cloud LoRA SFT, pass shell environment variables to `training_sft.sh` instead of adding uppercase flags to `training.py`:
+
+```bash
+MODELNAME=Qwen2.5-0.5B \
+DATA_ROOT=/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction_traced/ \
+BATCH_SIZE=4 \
+USE_PEFT=1 \
+LORA_R=8 \
+LORA_ALPHA=16 \
+LR=1e-4 \
+WARM_UP=100 \
+MIXED_PRECISION=fp16 \
+STAGE1_NEPOCH=1 \
+STAGE2_NEPOCH=1 \
+MAX_STAGE1_BATCHES=2000 \
+MAX_STAGE2_BATCHES=3000 \
+MAX_VALID_BATCHES=100 \
+TRAIN_LOG_EVERY=100 \
+bash training_sft.sh
+```
+
+`training.py` also accepts direct flags such as `--use_peft`, `--lora_r`, `--lora_alpha`, `--disable_text_extra_tokens`, `--override_lr`, and `--override_warm_up`.
+
 ## Model Switch
 
 Local smoke tests use `GPT2_6_act_nt`. Cloud runs can switch models through:

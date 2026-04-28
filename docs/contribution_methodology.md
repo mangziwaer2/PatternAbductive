@@ -429,18 +429,20 @@ conda run -n patternabductive python scripts/run_stage3_rollout_eval.py ^
 云端正式训练时建议：
 
 ```bash
-python training.py \
-  --data_root ./sampled_data_abduction_traced/ \
-  --train_stage stage2_loop \
-  --dataset_num_proc 16 \
-  --dataloader_num_workers 4 \
-  --dataloader_pin_memory true \
-  --dataloader_persistent_workers true \
-  --accelerate \
-  --mixed_precision bf16
+MODELNAME=Qwen2.5-0.5B \
+DATA_ROOT=/path/to/sampled_data_abduction_traced/ \
+BATCH_SIZE=4 \
+USE_PEFT=1 \
+LR=1e-4 \
+MIXED_PRECISION=fp16 \
+MAX_STAGE1_BATCHES=2000 \
+MAX_STAGE2_BATCHES=3000 \
+bash training_sft.sh
 ```
 
 `stage2_trace` 只服务于 SFT 的 next-step 监督；Stage 3 RL rollout 不读取它作为目标。RL 仍然从 `OBS` 出发，让模型自己生成 ACTION，工具实时插入 RESULT，再根据完整轨迹打分。
+
+LoRA 训练时脚本默认启用 `--disable_text_extra_tokens` 和 `--lora_modules_to_save none`，让 Qwen 直接用原 tokenizer 的普通文本 token 表示 `ACTION / DSL / PATTERN`，避免为了少量新增 token 训练整块 embedding/lm_head。
 
 ## 11. 当前代码入口
 

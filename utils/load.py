@@ -65,7 +65,12 @@ def load_model(path,contents,return_huggingface_model=True,epoch=0,
         loss_log = checkpoint['loss_log']
     else:
         loss_log = {'train': {}, 'valid': {}}
-    if return_huggingface_model and (transformers is None or not isinstance(model, transformers.PreTrainedModel)):
+    is_peft_model = hasattr(model, 'peft_config') or model.__class__.__name__.lower().startswith('peft')
+    if (
+            return_huggingface_model
+            and not is_peft_model
+            and (transformers is None or not isinstance(model, transformers.PreTrainedModel))
+            and hasattr(model, 'transformer')):
         print('Yes, returning .transformer')
         model = model.transformer
     return model, optimizer, scheduler, last_epoch, loss_log

@@ -148,6 +148,127 @@ def average_or_none(values):
     return (sum(values) / len(values)) if values else None
 
 
+def split_csv_arg(value):
+    return [
+        item.strip()
+        for item in str(value or '').split(',')
+        if item.strip()
+    ]
+
+
+def infer_lora_target_modules(model):
+    model_type = str(getattr(getattr(model, 'config', None), 'model_type', '') or '').lower()
+    if model_type == 'gpt2':
+        return ['c_attn', 'c_proj', 'c_fc']
+
+    known_targets = [
+        'q_proj',
+        'k_proj',
+        'v_proj',
+        'o_proj',
+        'gate_proj',
+        'up_proj',
+        'down_proj',
+        'c_attn',
+        'c_proj',
+        'c_fc',
+    ]
+    module_names = {
+        name.rsplit('.', 1)[-1]
+        for name, _ in model.named_modules()
+    }
+    return [
+        target
+        for target in known_targets
+        if target in module_names
+    ]
+
+
+def infer_lora_modules_to_save(model):
+    module_names = {
+        name.rsplit('.', 1)[-1]
+        for name, _ in model.named_modules()
+    }
+    preferred = ['embed_tokens', 'lm_head', 'wte']
+    return [
+        module_name
+        for module_name in preferred
+        if module_name in module_names
+    ]
+
+
+def resolve_lora_modules_to_save(model, raw_value):
+    value = str(raw_value or 'auto').strip()
+    if value.lower() in {'', 'auto'}:
+        return infer_lora_modules_to_save(model)
+    if value.lower() in {'none', 'false', '0'}:
+        return []
+    return split_csv_arg(value)
+
+
+def is_peft_model(model):
+    return hasattr(model, 'peft_config') or model.__class__.__name__.lower().startswith('peft')
+
+
+def apply_lora_if_requested(model, args):
+    if not args.use_peft:
+        return model, False
+    if is_peft_model(model):
+        print('# LoRA/PEFT already present in loaded model.')
+        return model, False
+
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:
+        raise ImportError('peft is required for --use_peft. Install it with `pip install peft`.') from exc
+
+    target_modules = split_csv_arg(args.lora_target_modules)
+    if not target_modules:
+        target_modules = infer_lora_target_modules(model)
+    if not target_modules:
+        raise ValueError(
+            'Could not infer LoRA target modules. Set --lora_target_modules explicitly, '
+            'for example: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj'
+        )
+    modules_to_save = resolve_lora_modules_to_save(model, args.lora_modules_to_save)
+
+    model_type = str(getattr(getattr(model, 'config', None), 'model_type', '') or '').lower()
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+        task_type='CAUSAL_LM',
+        target_modules=target_modules,
+        fan_in_fan_out=(model_type == 'gpt2'),
+        modules_to_save=modules_to_save or None,
+    )
+    model = get_peft_model(model, peft_config=lora_config)
+    print(f'# Enabled LoRA: r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}')
+    print(f'# LoRA target modules: {target_modules}')
+    print(f'# LoRA modules_to_save: {modules_to_save or []}')
+    if hasattr(model, 'print_trainable_parameters'):
+        model.print_trainable_parameters()
+    return model, True
+
+
+def create_optimizer_and_scheduler(model, config_train):
+    trainable_params = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    if not trainable_params:
+        raise RuntimeError('No trainable parameters found. Check --use_peft / LoRA configuration.')
+    optimizer = torch.optim.Adam(trainable_params, lr=float(config_train['lr']))
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        total_iters=config_train['warm_up'],
+    )
+    return optimizer, scheduler
+
+
 def collect_dataset_sizes(dataset_dict):
     return {
         split: int(dataset.shape[0])
@@ -449,10 +570,11 @@ def build_logged_input(source_value, condition_value):
 
 
 def run_generation(model, input_ids, attention_mask, tokenizer, max_length, top_k=0, do_sample=True):
+    max_new_tokens = max(1, int(max_length) - int(input_ids.shape[1]))
     generation_kwargs = dict(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_length=max_length,
+        max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -879,13 +1001,13 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
             use_pretrained_weights=args.use_pretrained_text_model,
             model_runtime_config=model_runtime_config,
         ).to(device)
-        if args.mode == 'training':
-            optimizer = torch.optim.Adam(model.parameters(), lr=float(config_train['lr']))
-            scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=0.1,
-                total_iters=config_train['warm_up'],
-            )
+
+    newly_wrapped_lora = False
+    if args.mode == 'training':
+        model, newly_wrapped_lora = apply_lora_if_requested(model, args)
+        model.to(device)
+        if optimizer is None or scheduler is None or newly_wrapped_lora:
+            optimizer, scheduler = create_optimizer_and_scheduler(model, config_train)
 
     if args.mode == 'optimizing' and args.rl_resume_epoch == 0 and args.rl_use_peft:
         from peft import LoraConfig, get_peft_model
@@ -1236,6 +1358,26 @@ def my_parse_args():
     parser.add_argument('--checkpoint_root', default='./ckpt/')
     parser.add_argument('-r', '--resume_epoch', type=int, default=0)
     parser.add_argument('--use_pretrained_text_model', action='store_true')
+    parser.add_argument(
+        '--disable_text_extra_tokens',
+        action='store_true',
+        help='Do not add ACTION/DSL/PATTERN as new tokenizer tokens; useful for lightweight LoRA on pretrained LMs.',
+    )
+    parser.add_argument('--use_peft', action='store_true')
+    parser.add_argument('--lora_r', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_dropout', type=float, default=0.05)
+    parser.add_argument('--lora_bias', default='none', choices=['none', 'all', 'lora_only'])
+    parser.add_argument(
+        '--lora_target_modules',
+        default='',
+        help='Comma-separated LoRA target modules. Empty means infer from model type.',
+    )
+    parser.add_argument(
+        '--lora_modules_to_save',
+        default='auto',
+        help='Comma-separated extra trainable modules to save with LoRA. Use auto/none.',
+    )
 
     parser.add_argument('--mode', default='training', choices=['training', 'testing', 'optimizing'])
     parser.add_argument('--accelerate', action='store_true')
@@ -1253,6 +1395,8 @@ def my_parse_args():
     parser.add_argument('--max_train_batches', type=int, default=0)
     parser.add_argument('--max_valid_batches', type=int, default=0)
     parser.add_argument('--override_nepoch', type=int, default=0)
+    parser.add_argument('--override_lr', type=float, default=0.0)
+    parser.add_argument('--override_warm_up', type=int, default=0)
 
     parser.add_argument('--experiment_root', default='./results/experiments/')
     parser.add_argument('--optim_experiment_root', default='./results/optim_experiments/')
@@ -1305,7 +1449,23 @@ def my_parse_args():
     parser.add_argument('--rl_init_kl_coef', type=float, default=0.2)
     parser.add_argument('--rl_cliprange', type=float, default=0.2)
 
-    return parser.parse_args()
+    parser.add_argument('--MAX_STAGE1_BATCHES', type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--MAX_STAGE2_BATCHES', type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--MAX_VALID_BATCHES', type=int, default=None, help=argparse.SUPPRESS)
+
+    args, unknown_args = parser.parse_known_args()
+    remaining_unknown = [arg for arg in unknown_args if arg != '\\']
+    if remaining_unknown:
+        parser.error(f'unrecognized arguments: {" ".join(remaining_unknown)}')
+
+    if args.train_stage == 'logic' and args.MAX_STAGE1_BATCHES is not None:
+        args.max_train_batches = args.MAX_STAGE1_BATCHES
+    if args.train_stage == 'stage2_loop' and args.MAX_STAGE2_BATCHES is not None:
+        args.max_train_batches = args.MAX_STAGE2_BATCHES
+    if args.MAX_VALID_BATCHES is not None:
+        args.max_valid_batches = args.MAX_VALID_BATCHES
+
+    return args
 
 
 def main():
@@ -1431,9 +1591,10 @@ def main():
     )
 
     print('Creating tokenizer')
+    text_extra_tokens = [] if args.disable_text_extra_tokens else get_text_extra_tokens(include_graph_tokens=False)
     tokenizer, ntoken = create_text_tokenizer(
         get_tokenizer_path(model_runtime_config),
-        extra_tokens=get_text_extra_tokens(include_graph_tokens=False),
+        extra_tokens=text_extra_tokens,
         closed_text_tokens=None,
         trust_remote_code=bool(model_runtime_config.get('trust_remote_code', False)),
     )
@@ -1448,6 +1609,12 @@ def main():
     if args.override_nepoch > 0:
         config_train = dict(config_train)
         config_train['nepoch'] = args.override_nepoch
+    if args.override_lr > 0:
+        config_train = dict(config_train)
+        config_train['lr'] = args.override_lr
+    if args.override_warm_up > 0:
+        config_train = dict(config_train)
+        config_train['warm_up'] = args.override_warm_up
     print(f'config_train:\n{config_train}')
 
     experiment_record = None

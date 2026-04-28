@@ -204,7 +204,7 @@ cython_debug/
 # Local editor state
 .idea/
 .vscode/
-
+docs/
 # Experiment artifacts
 ckpt/
 results/
