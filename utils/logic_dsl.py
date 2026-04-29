@@ -10,6 +10,8 @@ from utils.textualization import (
 
 
 DSL_CONTROL_TOKENS = [
+    '<DSL>',
+    '</DSL>',
     'PATTERN',
     'DSL',
     'QUERY',
@@ -19,6 +21,8 @@ DSL_CONTROL_TOKENS = [
     'OR',
     'NOT',
 ]
+DSL_START_TAG = '<DSL>'
+DSL_END_TAG = '</DSL>'
 
 DSL_OPERATOR_TO_SYMBOL = {
     'ENT': 'e',
@@ -181,8 +185,33 @@ def _tokenize_dsl(text: str) -> list[str]:
     return tokens
 
 
-def _strip_dsl_prefix(text: str) -> str:
+def strip_dsl_tags(text: str) -> str:
     text = str(text).strip()
+    start_index = text.find(DSL_START_TAG)
+    if start_index >= 0:
+        text = text[start_index + len(DSL_START_TAG):]
+        end_index = text.find(DSL_END_TAG)
+        if end_index >= 0:
+            text = text[:end_index]
+        return text.strip()
+    end_index = text.find(DSL_END_TAG)
+    if end_index >= 0:
+        text = text[:end_index]
+    return text.strip()
+
+
+def tag_dsl_text(dsl_text: str) -> str:
+    body = _strip_dsl_prefix(strip_dsl_tags(dsl_text))
+    return '\n'.join([DSL_START_TAG, f'DSL {body}'.strip(), DSL_END_TAG])
+
+
+def dsl_has_explicit_boundary(text: str) -> bool:
+    text = str(text or '')
+    return DSL_START_TAG in text and DSL_END_TAG in text
+
+
+def _strip_dsl_prefix(text: str) -> str:
+    text = strip_dsl_tags(text)
     if not text:
         return text
     for marker in ['DSL', 'QUERY']:
@@ -309,4 +338,4 @@ def logic_text_to_query_wordlist(text: str, kg):
 
 
 def build_pattern_dsl_target(pattern_str: str, query_text: str, kg) -> str:
-    return f'PATTERN {pattern_str_to_pattern_dsl(pattern_str)} DSL {surface_query_to_dsl(query_text, kg)}'
+    return f'PATTERN {pattern_str_to_pattern_dsl(pattern_str)} {tag_dsl_text(surface_query_to_dsl(query_text, kg))}'

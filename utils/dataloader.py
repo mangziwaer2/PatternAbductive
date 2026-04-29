@@ -8,19 +8,20 @@ from utils.load import (
     load_saved_processed_dataset,
     save_processed_dataset_to_disk,
 )
-from utils.logic_dsl import pattern_str_to_pattern_dsl, surface_query_to_dsl
-from utils.text_dataset import build_stage2_trace
+from utils.logic_dsl import pattern_str_to_pattern_dsl, surface_query_to_dsl, tag_dsl_text
+from utils.evidence import RESULT_END_TAG, RESULT_START_TAG
+from utils.text_dataset import build_stage2_trace, result_has_edges
+from utils.action_supervision import ACTION_END_TAG, ACTION_START_TAG, strip_action_tags
 
 
 REPRESENTATION_TEXT = 'text'
 DEFAULT_TRAIN_STAGE = 'logic'
-ACTION_SCHEMA_VERSION = 'actionv2'
+ACTION_SCHEMA_VERSION = 'actionv5_tagged_io'
 CURRENT_ACTION_PREFIXES = (
     'ACTION FIND_COMMON ',
     'ACTION FIND_ALTERNATIVE ',
     'ACTION FIND_EXCLUSION ',
     'ACTION EXPAND ',
-    'ACTION CHECK_COVERAGE ',
 )
 
 
@@ -138,7 +139,15 @@ def trace_uses_current_action_schema(trace) -> bool:
         if not action:
             continue
         action_count += 1
-        if not any(action.startswith(prefix) for prefix in CURRENT_ACTION_PREFIXES):
+        if ACTION_START_TAG not in action or ACTION_END_TAG not in action:
+            return False
+        action_body = strip_action_tags(action)
+        if not any(action_body.startswith(prefix) for prefix in CURRENT_ACTION_PREFIXES):
+            return False
+        result = str(event.get('result', '')).strip()
+        if RESULT_START_TAG not in result or RESULT_END_TAG not in result:
+            return False
+        if not result_has_edges(result):
             return False
     return action_count > 0
 
@@ -162,7 +171,7 @@ def _derive_stage2_traces_for_batch(batch, kg, graph_split, top_k):
     if missing_indices and kg is None:
         raise ValueError(
             'Stage 2 requires current-schema stage2_trace or a loaded KG. '
-            'Run scripts/hydrate_stage2_traces.py with --rebuild to prefill trace before fast SFT.'
+            'Run sampling.py again to generate traces, or train with --force_load_kg to rebuild them lazily.'
         )
 
     if not trace_values:
@@ -200,7 +209,7 @@ def _trace_to_prefix_samples(observation_text, trace, logic_dsl):
 
     steps.append({
         'source': '\n'.join([observation_text, *history_parts]),
-        'target': f'DSL {logic_dsl}',
+        'target': tag_dsl_text(logic_dsl),
         'target_type': 'dsl',
     })
     return steps
@@ -233,18 +242,18 @@ def prepare_train_stage_source_target_batch(
         pattern_dsl = _derive_pattern_dsl_values(batch)
         logic_dsl = _derive_logic_dsl_values(batch, kg=kg)
         target = [
-            f'PATTERN {pattern} DSL {logic}'
+            f'PATTERN {pattern} {tag_dsl_text(logic)}'
             for pattern, logic in zip(pattern_dsl, logic_dsl)
         ]
         extra = _build_common_extra(batch, kg=kg, observation=observation, result_top_k=result_top_k)
         extra['target_type'] = ['pattern_dsl'] * len(source)
         return source, target, extra
 
-    if train_stage == 'stage2_loop':
-        loop_source = []
-        loop_target = []
-        loop_target_type = []
-        loop_pattern_str = []
+    if train_stage == 'stage2':
+        stage2_source = []
+        stage2_target = []
+        stage2_target_type = []
+        stage2_pattern_str = []
 
         logic_dsl = _derive_logic_dsl_values(batch, kg=kg)
         prefix_samples_by_row = _build_stage2_prefix_samples_for_batch(
@@ -258,17 +267,17 @@ def prepare_train_stage_source_target_batch(
                 batch['pattern_str'],
                 prefix_samples_by_row):
             for step in steps:
-                loop_source.append(str(step.get('source', '')))
-                loop_target.append(str(step.get('target', '')))
-                loop_target_type.append(str(step.get('target_type', '')))
-                loop_pattern_str.append(pattern_str)
+                stage2_source.append(str(step.get('source', '')))
+                stage2_target.append(str(step.get('target', '')))
+                stage2_target_type.append(str(step.get('target_type', '')))
+                stage2_pattern_str.append(pattern_str)
 
         extra = {
-            'condition_text': [''] * len(loop_source),
-            'target_type': loop_target_type,
-            'pattern_str_values': loop_pattern_str,
+            'condition_text': [''] * len(stage2_source),
+            'target_type': stage2_target_type,
+            'pattern_str_values': stage2_pattern_str,
         }
-        return loop_source, loop_target, extra
+        return stage2_source, stage2_target, extra
 
     raise ValueError(f'Unsupported train_stage: {train_stage}')
 
@@ -290,7 +299,7 @@ def _select_dataset_rows(dataset, max_rows):
 
 def _cache_fields_for_stage(source_text_field, target_text_field, train_stage, result_top_k, max_rows):
     row_tag = 'full' if max_rows is None or max_rows <= 0 else f'first{int(max_rows)}'
-    schema_tag = ACTION_SCHEMA_VERSION if train_stage == 'stage2_loop' else 'logicv1'
+    schema_tag = ACTION_SCHEMA_VERSION if train_stage == 'stage2' else 'logicv2'
     stage_tag = f'{train_stage}|{schema_tag}|topk{int(result_top_k)}|rows-{row_tag}'
     return f'{source_text_field}|{stage_tag}', f'{target_text_field}|{stage_tag}'
 
@@ -309,7 +318,7 @@ def _stage_preprocess_needs_kg(raw_dataset, train_stage):
     needs_logic_dsl = 'logic_dsl' not in raw_dataset.column_names
     if train_stage == 'logic':
         return needs_logic_dsl
-    if train_stage == 'stage2_loop':
+    if train_stage == 'stage2':
         return needs_logic_dsl or not _dataset_has_current_trace(raw_dataset)
     return False
 

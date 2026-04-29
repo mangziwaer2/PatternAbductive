@@ -1,49 +1,50 @@
 from utils.kg_actions import execute_action_text, parse_action_text
-from utils.logic_dsl import looks_like_dsl
+from utils.logic_dsl import (
+    DSL_END_TAG,
+    DSL_START_TAG,
+    extract_dsl_text as normalize_dsl_text,
+    looks_like_dsl,
+)
+from utils.action_supervision import (
+    ACTION_END_TAG,
+    ACTION_START_TAG,
+    action_has_explicit_boundary,
+)
 
 
 def is_complete_action_text(action_text: str) -> bool:
+    if not action_has_explicit_boundary(action_text):
+        return False
     try:
         action = parse_action_text(action_text)
     except Exception:
         return False
-    if not action.get('action_type'):
-        return False
-    if action.get('action_type') == 'CHECK_COVERAGE':
-        return bool(action.get('candidates')) and bool(action.get('obs'))
-    return bool(action.get('targets'))
+    return bool(action.get('action_type')) and bool(action.get('targets'))
 
 
 def extract_action_text(generated_text: str) -> str | None:
     text = str(generated_text).strip()
-    action_index = text.find('ACTION')
-    if action_index < 0:
+    tag_index = text.find(ACTION_START_TAG)
+    if tag_index < 0:
         return None
-    text = text[action_index:]
-    for delimiter in ['\nRESULT', '\nDSL', '\nTASK', '\nPATTERN']:
-        delimiter_index = text.find(delimiter)
-        if delimiter_index > 0:
-            text = text[:delimiter_index]
-    first_line = text.splitlines()[0].strip() if text.splitlines() else text.strip()
-    if not first_line:
+    end_index = text.find(ACTION_END_TAG, tag_index + len(ACTION_START_TAG))
+    if end_index < 0:
         return None
-    return first_line if is_complete_action_text(first_line) else None
+    candidate = text[tag_index:end_index + len(ACTION_END_TAG)].strip()
+    return candidate if is_complete_action_text(candidate) else None
 
 
 def extract_dsl_text(generated_text: str) -> str | None:
     text = str(generated_text).strip()
-    dsl_index = text.find('DSL')
-    if dsl_index >= 0:
-        candidate = text[dsl_index + len('DSL'):].strip()
-    else:
-        candidate = text
-    for delimiter in ['\nACTION', '\nRESULT', '\nTASK', '\nPATTERN']:
-        delimiter_index = candidate.find(delimiter)
-        if delimiter_index > 0:
-            candidate = candidate[:delimiter_index]
-    candidate = candidate.strip()
-    if looks_like_dsl(candidate):
-        return candidate
+    tag_index = text.find(DSL_START_TAG)
+    if tag_index >= 0:
+        end_index = text.find(DSL_END_TAG, tag_index + len(DSL_START_TAG))
+        if end_index < 0:
+            return None
+        candidate = text[tag_index:end_index + len(DSL_END_TAG)].strip()
+        dsl_text = normalize_dsl_text(candidate)
+        return dsl_text if looks_like_dsl(dsl_text) else None
+
     return None
 
 

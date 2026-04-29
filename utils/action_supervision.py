@@ -3,30 +3,30 @@ from utils.textualization import tokenize_surface_text
 
 
 ACTION_CONTROL_TOKENS = [
+    '<ACTION>',
+    '</ACTION>',
     'ACTION',
     'TARGETS',
-    'CANDIDATES',
-    'OBS',
     'DIRECTION',
     'TOP_K',
     'FIND_COMMON',
     'FIND_ALTERNATIVE',
     'FIND_EXCLUSION',
     'EXPAND',
-    'CHECK_COVERAGE',
 ]
 VALID_ACTION_TYPES = {
     'FIND_COMMON',
     'FIND_ALTERNATIVE',
     'FIND_EXCLUSION',
     'EXPAND',
-    'CHECK_COVERAGE',
 }
 ACTION_ALIASES = {
     'FIND_COMMON_CAUSE': 'FIND_COMMON',
     'FIND_ALTERNATIVE_CAUSES': 'FIND_ALTERNATIVE',
     'FIND_NEGATIVE_EVIDENCE': 'FIND_EXCLUSION',
 }
+ACTION_START_TAG = '<ACTION>'
+ACTION_END_TAG = '</ACTION>'
 
 
 def extract_observation_entity_tokens(observation_text: str) -> list[str]:
@@ -103,28 +103,48 @@ def normalize_action_type(action_type: str) -> str:
     return normalized
 
 
+def strip_action_tags(action_text: str) -> str:
+    text = str(action_text or '').strip()
+    start_index = text.find(ACTION_START_TAG)
+    if start_index >= 0:
+        text = text[start_index + len(ACTION_START_TAG):]
+        end_index = text.find(ACTION_END_TAG)
+        if end_index >= 0:
+            text = text[:end_index]
+        return text.strip()
+    end_index = text.find(ACTION_END_TAG)
+    if end_index >= 0:
+        text = text[:end_index]
+    return text.strip()
+
+
+def action_has_explicit_boundary(action_text: str) -> bool:
+    text = str(action_text or '')
+    return ACTION_START_TAG in text and ACTION_END_TAG in text
+
+
+def tag_action_text(action_text: str) -> str:
+    body = strip_action_tags(action_text)
+    return '\n'.join([ACTION_START_TAG, body, ACTION_END_TAG])
+
+
 def render_action_text(
         action_type: str,
         targets: list[str] | None = None,
         top_k: int = 10,
-        candidates: list[str] | None = None,
-        obs: list[str] | None = None,
-        direction: str | None = None) -> str:
+        direction: str | None = None,
+        tagged: bool = True) -> str:
     action_type = normalize_action_type(action_type)
     parts = ['ACTION', action_type]
 
-    if action_type == 'CHECK_COVERAGE':
-        candidate_text = ' '.join(candidates or targets or [])
-        obs_text = ' '.join(obs or [])
-        parts.extend(['CANDIDATES', candidate_text, 'OBS', obs_text])
-    else:
-        target_text = ' '.join(targets or [])
-        parts.extend(['TARGETS', target_text])
-        if action_type == 'EXPAND':
-            parts.extend(['DIRECTION', str(direction or 'backward')])
+    target_text = ' '.join(targets or [])
+    parts.extend(['TARGETS', target_text])
+    if action_type == 'EXPAND':
+        parts.extend(['DIRECTION', str(direction or 'backward')])
 
     parts.extend(['TOP_K', str(int(top_k))])
-    return ' '.join(part for part in parts if str(part).strip()).strip()
+    body = ' '.join(part for part in parts if str(part).strip()).strip()
+    return tag_action_text(body) if tagged else body
 
 
 def build_action_text(

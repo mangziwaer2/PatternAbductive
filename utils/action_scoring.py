@@ -1,4 +1,6 @@
+from utils.action_supervision import strip_action_tags
 from utils.kg_actions import execute_action, parse_action_text
+from utils.evidence import strip_result_tags
 from utils.textualization import tokenize_surface_text
 
 
@@ -30,12 +32,14 @@ def compute_evidence_coverage(evidence: dict) -> float:
 def extract_frontier_entity_tokens(context_text: str) -> list[str]:
     candidate_tokens = []
     observation_tokens = []
-    for line in str(context_text).splitlines():
+    for line in strip_result_tags(context_text).splitlines():
+        if line == 'RESULT':
+            continue
         tokens = tokenize_surface_text(line)
         if not tokens:
             continue
-        if tokens[0] == 'CANDIDATE' and len(tokens) >= 2:
-            candidate_tokens.append(tokens[1])
+        if len(tokens) >= 5 and tokens[1] == '--' and tokens[3] == '-->':
+            candidate_tokens.append(tokens[0])
         elif tokens[0] == 'OBS':
             observation_tokens.extend(
                 token
@@ -105,19 +109,21 @@ def score_action_text(
     result['candidate_count'] = len(evidence.get('candidates', []))
     result['candidate_count_score'] = min(result['candidate_count'], int(action.get('top_k', 10))) / max(int(action.get('top_k', 10)), 1)
     result['evidence_coverage'] = compute_evidence_coverage(evidence)
-    result['repeat_action_penalty'] = 1.0 if str(action_text).strip() in {
-        line.strip()
+    current_action = strip_action_tags(action_text)
+    previous_actions = {
+        strip_action_tags(line.strip())
         for line in str(observation_text).splitlines()
-        if line.strip().startswith('ACTION ')
-    } else 0.0
+        if line.strip().startswith('ACTION ') or line.strip().startswith('<ACTION>')
+    }
+    result['repeat_action_penalty'] = 1.0 if current_action in previous_actions else 0.0
 
     result['action_reward'] = float(
         0.2 * result['action_parse_success']
-        + 0.2 * result['action_execution_success']
-        + 1.0 * result['evidence_coverage']
-        + 0.3 * result['candidate_count_score']
-        + 0.5 * result['target_grounding']
-        + 0.2 * result['target_diversity']
+        + 0.4 * result['action_execution_success']
+        + 0.2 * result['evidence_coverage']
+        + 0.4 * result['candidate_count_score']
+        + 0.4 * result['target_grounding']
+        + 0.1 * result['target_diversity']
         - 0.5 * result['repeat_action_penalty']
     )
     return result

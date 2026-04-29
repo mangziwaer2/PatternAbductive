@@ -98,16 +98,18 @@ def build_sample_records(args, mode, answers_from, query, pattern_str, base_samp
         rng=rng,
         excluded_condition_types=args.exclude_condition_types,
     )
-    return [
-        build_minimal_text_record(
+    records = []
+    for record_index, record in enumerate(expanded_records):
+        minimal_record = build_minimal_text_record(
             record=record,
             kg=kg,
             sample_id=(int(base_sample_id) * 1000) + record_index,
             graph_split=mode,
             result_top_k=args.result_top_k,
         )
-        for record_index, record in enumerate(expanded_records)
-    ]
+        if minimal_record is not None:
+            records.append(minimal_record)
+    return records
 
 
 def flush_records(records, output_path, rng):
@@ -212,7 +214,10 @@ def write_text_format_manifest(output_dir, args):
             'Sampling writes compact abduction SFT rows directly.',
             'Raw rows keep only pattern_str, observation_text, logic_dsl, and stage2_trace.',
             'stage2_trace stores graph-search ACTION/RESULT events; dataloader expands it into prefix-to-next-step SFT samples.',
-            'ACTION uses repeated one-hop graph search: FIND_COMMON/FIND_ALTERNATIVE/FIND_EXCLUSION, EXPAND, and CHECK_COVERAGE.',
+            'ACTION calls are wrapped in <ACTION>...</ACTION> to provide an explicit tool-call boundary.',
+            'RESULT blocks are wrapped in <RESULT>...</RESULT> and contain only compact subgraph edge lines.',
+            'DSL targets are wrapped by the dataloader as <DSL>...</DSL> during training.',
+            'ACTION uses repeated one-hop graph search: FIND_COMMON/FIND_ALTERNATIVE/FIND_EXCLUSION followed by optional EXPAND.',
             'Oracle depth fields are not exposed; deeper evidence is represented by repeated EXPAND calls.',
         ],
         'exclude_condition_types': args.exclude_condition_types,

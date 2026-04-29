@@ -2,10 +2,10 @@ from utils.action_supervision import (
     extract_observation_entity_tokens,
     normalize_action_type,
     render_action_text,
+    strip_action_tags,
     VALID_ACTION_TYPES,
 )
 from utils.evidence import (
-    build_candidate_coverage_evidence,
     build_common_cause_evidence,
     build_expand_evidence,
     render_evidence_package,
@@ -13,11 +13,11 @@ from utils.evidence import (
 from utils.textualization import tokenize_surface_text
 
 
-ACTION_FIELD_TOKENS = {'TARGETS', 'CANDIDATES', 'OBS', 'DIRECTION', 'TOP_K'}
+ACTION_FIELD_TOKENS = {'TARGETS', 'DIRECTION', 'TOP_K'}
 
 
 def parse_action_text(action_text: str) -> dict:
-    tokens = tokenize_surface_text(action_text)
+    tokens = tokenize_surface_text(strip_action_tags(action_text))
     if not tokens or tokens[0] != 'ACTION':
         raise ValueError(f'Action must start with ACTION: {action_text}')
     if len(tokens) < 2:
@@ -26,8 +26,6 @@ def parse_action_text(action_text: str) -> dict:
     action = {
         'action_type': normalize_action_type(tokens[1]),
         'targets': [],
-        'candidates': [],
-        'obs': [],
         'direction': 'backward',
         'top_k': 10,
     }
@@ -37,18 +35,13 @@ def parse_action_text(action_text: str) -> dict:
     index = 2
     while index < len(tokens):
         token = tokens[index]
-        if token in {'TARGETS', 'CANDIDATES', 'OBS'}:
+        if token == 'TARGETS':
             index += 1
             values = []
             while index < len(tokens) and tokens[index] not in ACTION_FIELD_TOKENS:
                 values.append(tokens[index])
                 index += 1
-            if token == 'TARGETS':
-                action['targets'] = values
-            elif token == 'CANDIDATES':
-                action['candidates'] = values
-            else:
-                action['obs'] = values
+            action['targets'] = values
             continue
         if token == 'DIRECTION' and index + 1 < len(tokens):
             action['direction'] = str(tokens[index + 1]).lower()
@@ -67,8 +60,6 @@ def render_action(action: dict) -> str:
     return render_action_text(
         action_type=action.get('action_type', 'FIND_COMMON'),
         targets=action.get('targets', []),
-        candidates=action.get('candidates', []),
-        obs=action.get('obs', []),
         direction=action.get('direction', 'backward'),
         top_k=int(action.get('top_k', 10)),
     )
@@ -123,17 +114,6 @@ def execute_action(action: dict, kg, graph_split: str = 'train') -> dict:
             graph_split=graph_split,
             top_k=top_k,
             direction=action.get('direction', 'backward'),
-        )
-
-    if action_type == 'CHECK_COVERAGE':
-        candidate_text = 'OBS ' + ' '.join(action.get('candidates') or action.get('targets') or [])
-        observation_text = 'OBS ' + ' '.join(action.get('obs') or [])
-        return build_candidate_coverage_evidence(
-            candidate_text=candidate_text,
-            observation_text=observation_text,
-            kg=kg,
-            graph_split=graph_split,
-            top_k=top_k,
         )
 
     raise ValueError(f'Unsupported action type: {action_type}')

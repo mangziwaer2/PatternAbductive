@@ -1,7 +1,6 @@
 import argparse
 import csv
 import datetime
-import inspect
 import json
 import logging
 import os
@@ -30,25 +29,21 @@ from model.tokenizer import (
     decode_text_token_ids,
     extract_text_sample_to_device,
     get_text_extra_tokens,
-    source_to_prompt,
 )
 from model.transformer import (
     create_transformer,
     get_tokenizer_path,
     resolve_model_runtime_config,
 )
-from utils.condition import DEFAULT_EXCLUDED_CONDITION_TYPES, normalize_condition_type_list
 from utils.dataloader import (
-    filter_dataset_by_excluded_condition_types,
     new_create_dataloader,
     new_create_dataset,
     record_has_current_stage2_trace,
 )
 from utils.load import load_kg, load_model, load_yaml, resolve_sampled_dataset_path
-from utils.stat_util import stat_scores_by_pattern
-from utils.rl_rewards import score_rollout_trajectory, score_stage2_completion_batch
-from utils.text_scoring import score_text_query_batch
+from utils.rl_rewards import score_rollout_trajectory
 from utils.tool_loop import extract_action_text, extract_dsl_text, run_action_tool_call
+from utils.generation_control import stream_generate_until_tags
 
 
 PIPELINE_TAG = 'text2text'
@@ -304,7 +299,7 @@ def training_data_needs_kg(args, splits):
 
         if 'logic_dsl' not in first_record:
             return True
-        if args.train_stage == 'stage2_loop' and not record_has_current_stage2_trace(first_record):
+        if args.train_stage == 'stage2' and not record_has_current_stage2_trace(first_record):
             return True
 
     return False
@@ -370,7 +365,8 @@ def prepare_experiment_record(args, dataset_dict, config_train, config_dataloade
     append_text_log(paths['comparison_log_path'], '# Prediction vs Groundtruth')
     append_text_log(
         paths['comparison_log_path'],
-        f'# comparison_samples={args.comparison_samples}, comparison_frequency={args.comparison_frequency}',
+        f'# comparison_samples={args.comparison_samples}, comparison_frequency={args.comparison_frequency}, '
+        f'comparison_random={args.comparison_random}',
     )
     return {
         'name': experiment_name,
@@ -381,7 +377,7 @@ def prepare_experiment_record(args, dataset_dict, config_train, config_dataloade
 
 def prepare_rl_experiment_record(args, dataset_dict, device):
     experiment_name = build_experiment_name(args)
-    experiment_dir = os.path.join(args.optim_experiment_root, experiment_name)
+    experiment_dir = os.path.join(args.rl_experiment_root, experiment_name)
     pathlib.Path(experiment_dir).mkdir(parents=True, exist_ok=True)
 
     paths = {
@@ -426,7 +422,8 @@ def prepare_rl_experiment_record(args, dataset_dict, device):
     append_text_log(paths['comparison_log_path'], '# Prediction vs Groundtruth')
     append_text_log(
         paths['comparison_log_path'],
-        f'# comparison_samples={args.comparison_samples}, comparison_frequency={args.comparison_frequency}',
+        f'# comparison_samples={args.comparison_samples}, comparison_frequency={args.comparison_frequency}, '
+        f'comparison_random={args.comparison_random}',
     )
     return {
         'name': experiment_name,
@@ -527,11 +524,14 @@ def wrap_single_sample(sample):
     return {key: [value] for key, value in sample.items()}
 
 
-def select_sample_indices(dataset_size, num_samples):
+def select_sample_indices(dataset_size, num_samples, randomize=False, seed=0):
     if dataset_size <= 0 or num_samples <= 0:
         return []
     if num_samples >= dataset_size:
         return list(range(dataset_size))
+    if randomize:
+        rng = random.Random(int(seed))
+        return sorted(rng.sample(range(dataset_size), num_samples))
     if num_samples == 1:
         return [0]
 
@@ -602,7 +602,13 @@ def log_prediction_comparisons(
             continue
 
         dataset = dataset_dict[split]
-        indices = select_sample_indices(len(dataset), args.comparison_samples)
+        seed_offset = sum(ord(char) for char in f'{stage_label}:{split}')
+        indices = select_sample_indices(
+            len(dataset),
+            args.comparison_samples,
+            randomize=args.comparison_random,
+            seed=args.seed + seed_offset,
+        )
         emit_text_log(f'[{split}] logged_indices={indices}', log_path, also_print=args.comparison_console)
 
         for sample_index in indices:
@@ -643,35 +649,6 @@ def log_prediction_comparisons(
             emit_text_log('', log_path, also_print=args.comparison_console)
 
 
-def parse_rl_factors(raw_value):
-    if isinstance(raw_value, (list, tuple)):
-        factors = [float(value) for value in raw_value]
-    else:
-        text = str(raw_value).strip()
-        try:
-            parsed = json.loads(text)
-            if not isinstance(parsed, list):
-                raise ValueError
-            factors = [float(value) for value in parsed]
-        except Exception:
-            factors = [float(token.strip()) for token in text.split(',') if token.strip()]
-
-    while len(factors) < 4:
-        factors.append(1.0)
-    return factors[:4]
-
-
-def build_grpo_dataset(dataset):
-    dataset = dataset.map(
-        lambda example: source_to_prompt(example)
-    )
-    keep_columns = ['prompt', 'source', 'target', DEFAULT_CONDITION_TEXT_FIELD, 'target_type']
-    removable = [column for column in dataset.column_names if column not in keep_columns]
-    if removable:
-        dataset = dataset.remove_columns(removable)
-    return dataset
-
-
 def _extract_dsl_target_text(target: str) -> str:
     text = str(target or '').strip()
     if ' DSL ' in text:
@@ -701,31 +678,18 @@ def _build_rollout_prompt(observation_text, history):
 
 
 @torch.no_grad()
-def _sample_rollout_completion(model, tokenizer, prompt, device, args):
-    tokenized = tokenizer(prompt, return_tensors='pt').to(device)
-    input_len = tokenized.input_ids.shape[-1]
-    generation_kwargs = {
-        'input_ids': tokenized.input_ids,
-        'attention_mask': tokenized.attention_mask,
-        'max_new_tokens': args.rl_max_completion_length,
-        'pad_token_id': tokenizer.pad_token_id,
-        'bos_token_id': tokenizer.bos_token_id,
-        'eos_token_id': tokenizer.eos_token_id,
-        'do_sample': True,
-        'temperature': args.rl_temperature,
-    }
-    if args.rl_top_k > 0:
-        generation_kwargs['top_k'] = args.rl_top_k
-    if args.rl_top_p < 1.0:
-        generation_kwargs['top_p'] = args.rl_top_p
-    output = model.generate(**generation_kwargs)
-    generated_ids = output[0, input_len:].detach().cpu().tolist()
-    completion = decode_text_token_ids(tokenizer, generated_ids, preserve_whitespace=True)
-    return {
-        'prompt': prompt,
-        'generated_ids': generated_ids,
-        'completion': completion,
-    }
+def _stream_rollout_segment(model, tokenizer, prompt, device, args):
+    return stream_generate_until_tags(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        device=device,
+        max_new_tokens=args.rl_max_completion_length,
+        do_sample=True,
+        temperature=args.rl_temperature,
+        top_k=args.rl_top_k,
+        top_p=args.rl_top_p,
+    )
 
 
 def rollout_once(model, tokenizer, kg, record, device, args):
@@ -739,10 +703,32 @@ def rollout_once(model, tokenizer, kg, record, device, args):
 
     for step in range(1, args.rl_max_action_steps + 1):
         prompt = _build_rollout_prompt(observation, history)
-        segment = _sample_rollout_completion(model, tokenizer, prompt, device, args)
+        segment = _stream_rollout_segment(model, tokenizer, prompt, device, args)
         segments.append(segment)
         generated = segment['completion']
         raw_generations.append({'step': step, 'prompt': prompt, 'generated': generated})
+
+        action_text = extract_action_text(generated)
+        if action_text is not None:
+            try:
+                tool_output = run_action_tool_call(
+                    observation_text=observation,
+                    action_text=action_text,
+                    kg=kg,
+                    graph_split=args.rl_search_split,
+                )
+            except Exception as exc:
+                history.append(action_text)
+                return {
+                    'observation': observation,
+                    'history': history,
+                    'dsl': '',
+                    'raw_generations': [*raw_generations, {'step': step, 'tool_error': str(exc)}],
+                    'segments': segments,
+                    'stopped_by': 'action_execution_error',
+                }
+            history.extend([action_text, tool_output['result_text']])
+            continue
 
         dsl_text = extract_dsl_text(generated)
         if dsl_text is not None:
@@ -755,38 +741,17 @@ def rollout_once(model, tokenizer, kg, record, device, args):
                 'stopped_by': 'dsl',
             }
 
-        action_text = extract_action_text(generated)
-        if action_text is None:
-            return {
-                'observation': observation,
-                'history': history,
-                'dsl': '',
-                'raw_generations': raw_generations,
-                'segments': segments,
-                'stopped_by': 'unparseable_generation',
-            }
-
-        try:
-            tool_output = run_action_tool_call(
-                observation_text=observation,
-                action_text=action_text,
-                kg=kg,
-                graph_split=args.rl_search_split,
-            )
-        except Exception as exc:
-            history.append(action_text)
-            return {
-                'observation': observation,
-                'history': history,
-                'dsl': '',
-                'raw_generations': [*raw_generations, {'step': step, 'tool_error': str(exc)}],
-                'segments': segments,
-                'stopped_by': 'action_execution_error',
-            }
-        history.extend([action_text, tool_output['result_text']])
+        return {
+            'observation': observation,
+            'history': history,
+            'dsl': '',
+            'raw_generations': raw_generations,
+            'segments': segments,
+            'stopped_by': 'unparseable_generation',
+        }
 
     prompt = _build_rollout_prompt(observation, history)
-    segment = _sample_rollout_completion(model, tokenizer, prompt, device, args)
+    segment = _stream_rollout_segment(model, tokenizer, prompt, device, args)
     segments.append(segment)
     generated = segment['completion']
     raw_generations.append({'step': 'final', 'prompt': prompt, 'generated': generated})
@@ -848,7 +813,7 @@ def optimize_rollout_policy(args, dataset, model, tokenizer, graph_samplers, kg,
     output_dir = (
         experiment_record['paths']['experiment_dir']
         if experiment_record is not None
-        else os.path.join(args.optim_experiment_root, build_experiment_name(args))
+        else os.path.join(args.rl_experiment_root, build_experiment_name(args))
     )
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
     log_path = (
@@ -932,120 +897,6 @@ def optimize_rollout_policy(args, dataset, model, tokenizer, graph_samplers, kg,
     save_model(final_path, 'rlmodel', model, optimizer=optimizer, epoch=args.rl_epochs, loss_log={'rollout_step': max_steps})
     metrics['final_checkpoint'] = final_path
     return SimpleNamespace(metrics=metrics)
-
-
-def optimize_grpo(args, dataset, model, tokenizer, graph_samplers, kg, batch_size, experiment_record=None):
-    try:
-        from trl import GRPOConfig, GRPOTrainer
-    except ImportError as exc:
-        raise ImportError('TRL is required for optimizing mode. Please install `trl`.') from exc
-
-    dataset = build_grpo_dataset(dataset)
-    output_dir = (
-        experiment_record['paths']['experiment_dir']
-        if experiment_record is not None
-        else f'./results/optim/{build_experiment_name(args)}'
-    )
-    report_to = None if str(args.rl_report_to).lower() in {'', 'none', 'null'} else args.rl_report_to
-    rl_factors = parse_rl_factors(args.rl_factor)
-
-    def reward_func(prompts, completions, target, source, condition_text=None, target_type=None, **kwargs):
-        condition_texts = condition_text or [''] * len(completions)
-        if args.train_stage == 'stage2_loop':
-            target_types = target_type or [''] * len(completions)
-            scores = score_stage2_completion_batch(
-                completions=completions,
-                targets=target,
-                sources=source,
-                condition_texts=condition_texts,
-                target_types=target_types,
-                kg=kg,
-                graph_samplers=graph_samplers,
-                graph_split=args.rl_search_split,
-            )
-            return [float(score['stage3_reward']) for score in scores]
-
-        scores = score_text_query_batch(
-            completions=completions,
-            targets=target,
-            sources=source,
-            condition_texts=condition_texts,
-            kg=kg,
-            graph_samplers=graph_samplers,
-            searching_split=args.rl_search_split,
-        )
-        return [
-            float(
-                score['jaccard'] * rl_factors[0]
-                + score['dice'] * rl_factors[1]
-                + score['overlap'] * rl_factors[2]
-                + score['condition'] * rl_factors[3]
-            )
-            for score in scores
-        ]
-
-    grpo_config = GRPOConfig(
-        seed=args.seed,
-        output_dir=output_dir,
-        num_train_epochs=args.rl_epochs,
-        max_steps=args.rl_max_steps,
-        learning_rate=args.rl_lr,
-        max_prompt_length=args.rl_max_prompt_length,
-        max_completion_length=args.rl_max_completion_length,
-        num_generations=args.rl_num_generations,
-        logging_steps=args.rl_logging_steps,
-        save_steps=args.rl_save_steps,
-        log_completions=args.rl_log_completions,
-        report_to=report_to,
-        beta=args.rl_init_kl_coef,
-        epsilon=args.rl_cliprange,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        remove_unused_columns=False,
-    )
-    print(grpo_config)
-
-    original_forward = None
-    if 'logits_to_keep' not in inspect.signature(model.forward).parameters:
-        original_forward = model.forward
-
-        def forward_with_grpo_compat(*forward_args, **forward_kwargs):
-            forward_kwargs.pop('logits_to_keep', None)
-            return original_forward(*forward_args, **forward_kwargs)
-
-        model.forward = forward_with_grpo_compat
-
-    model.warnings_issued = {}
-    original_add_model_tags = getattr(model, 'add_model_tags', None)
-
-    def dummy_add_model_tags(self, tags):
-        return None
-
-    model.add_model_tags = dummy_add_model_tags.__get__(model)
-    trainer = GRPOTrainer(
-        args=grpo_config,
-        model=model,
-        reward_funcs=reward_func,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-    )
-    trainer_result = trainer.train()
-    if original_forward is not None:
-        model.forward = original_forward
-    if original_add_model_tags is not None:
-        model.add_model_tags = original_add_model_tags
-    elif 'add_model_tags' in model.__dict__:
-        del model.__dict__['add_model_tags']
-
-    trainer.save_model(output_dir)
-    ckpt_path = get_checkpoint_path(args, args.rl_epochs, optimized=True)
-    save_model(ckpt_path, 'rlmodel', model, epoch=args.rl_epochs)
-    if experiment_record is not None:
-        append_text_log(
-            experiment_record['paths']['run_log_path'],
-            json.dumps(trainer_result.metrics, ensure_ascii=False, indent=2),
-        )
-    return trainer_result
 
 
 def extract_sample_batch(args, device, sample, tokenizer, src_len, tgt_len, is_gen):
@@ -1201,7 +1052,7 @@ def get_checkpoint_candidates(args, epoch, optimized=False):
     candidates = []
     for suffix in suffixes:
         if optimized:
-            filename = f'{args.dataname}-{args.scale}-{args.max_answer_size}-{epoch}-optimize-{suffix}.pth'
+            filename = f'{args.dataname}-{args.scale}-{args.max_answer_size}-{epoch}-rl-{suffix}.pth'
         else:
             filename = f'{args.dataname}-{args.scale}-{args.max_answer_size}-{epoch}-{suffix}.pth'
         candidates.append(os.path.join(args.checkpoint_root, args.modelname, filename))
@@ -1229,7 +1080,7 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
     last_epoch = 0
     loss_log = {'train': {}, 'valid': {}}
 
-    if args.mode in ['optimizing', 'testing'] and args.rl_resume_epoch != 0:
+    if args.mode == 'rl' and args.rl_resume_epoch != 0:
         resume_path = get_resume_checkpoint_path(args, args.rl_resume_epoch, optimized=True)
         print(f'Loading RL model: {resume_path}')
         model, optimizer, scheduler, last_epoch, loss_log = load_model(
@@ -1281,7 +1132,7 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
         if optimizer is None or scheduler is None or newly_wrapped_lora:
             optimizer, scheduler = create_optimizer_and_scheduler(model, config_train)
 
-    if args.mode == 'optimizing' and args.rl_resume_epoch == 0 and args.rl_use_peft:
+    if args.mode == 'rl' and args.rl_resume_epoch == 0 and args.rl_use_peft:
         original_use_peft = args.use_peft
         args.use_peft = True
         model, _ = apply_lora_if_requested(model, args)
@@ -1488,107 +1339,6 @@ def mask_source(device, source_attention_mask, pred, tokenizer):
     pred[prefix_mask == 1] = tokenizer.pad_token_id
 
 
-@torch.no_grad()
-def test_loop(
-        args,
-        dataloader,
-        model,
-        tokenizer,
-        graph_samplers,
-        pattern_filtered,
-        searching_split,
-        resume_epoch,
-        src_len,
-        tgt_len,
-        kg,
-        device,
-        accelerator):
-    score_file_suffix = f'test|{args.test_proportion}x{args.test_split}_topk{args.test_top_k}'
-    if args.rl_resume_epoch != 0:
-        score_file_suffix += f'|grpo-{args.rl_resume_epoch}'
-    score_file_suffix = sanitize_filename_component(score_file_suffix)
-
-    if accelerator is not None:
-        model, dataloader = accelerator.prepare(model, dataloader)
-
-    model.eval()
-    niter = len(dataloader)
-    scores_all = []
-    pattern_id_all = []
-    score_df = None
-    do_sample = args.test_top_k > 0
-
-    import torch.distributed as dist
-
-    with torch.no_grad():
-        for _, sample in (pbar := tqdm(
-                enumerate(dataloader, start=1),
-                total=niter,
-                disable=(accelerator is not None) and (not accelerator.is_local_main_process))):
-            source, target, pattern_id, input_ids, attention_mask, _, source_attention_mask, condition = \
-                extract_sample_batch(
-                    args=args,
-                    device=device,
-                    sample=sample,
-                    tokenizer=tokenizer,
-                    src_len=src_len,
-                    tgt_len=tgt_len,
-                    is_gen=True,
-                )
-
-            pred = run_generation(
-                model=accelerator.unwrap_model(model) if accelerator is not None else model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                tokenizer=tokenizer,
-                max_length=input_ids.shape[1] + tgt_len,
-                top_k=args.test_top_k,
-                do_sample=do_sample,
-            )
-            mask_source(device, source_attention_mask, pred, tokenizer)
-            pred_decoded = [decode_text_token_ids(tokenizer, sequence.tolist()) for sequence in pred]
-
-            scores = score_text_query_batch(
-                completions=pred_decoded,
-                targets=target,
-                sources=source,
-                condition_texts=condition,
-                kg=kg,
-                graph_samplers=graph_samplers,
-                searching_split=searching_split,
-            )
-
-            if accelerator is not None:
-                gathered_scores = [None] * accelerator.num_processes
-                gathered_pattern_id = [None] * accelerator.num_processes
-                dist.all_gather_object(gathered_scores, scores)
-                dist.all_gather_object(gathered_pattern_id, list(pattern_id))
-                gathered_scores = [item for chunk in gathered_scores for item in chunk]
-                gathered_pattern_id = [item for chunk in gathered_pattern_id for item in chunk]
-            else:
-                gathered_scores = scores
-                gathered_pattern_id = list(pattern_id)
-
-            if accelerator is None or accelerator.is_main_process:
-                scores_all.extend(gathered_scores)
-                pattern_id_all.extend(gathered_pattern_id)
-                score_df = stat_scores_by_pattern(scores_all, pattern_id_all, pattern_filtered)
-                pbar.set_description(
-                    f's: {round(score_df.loc["all", ("smatch", "mean")], 4)}, '
-                    f'j: {round(score_df.loc["all", ("jaccard", "mean")], 4)}'
-                )
-                scores_path = os.path.join(
-                    args.result_root,
-                    args.modelname,
-                    f'{args.dataname}-{args.scale}-{args.max_answer_size}-{resume_epoch}-scores({score_file_suffix}).csv',
-                )
-                score_df.to_csv(scores_path)
-
-    if score_df is None:
-        raise RuntimeError('Test dataloader is empty; no scores were produced.')
-    return score_df
-
-
 def save_model(path, contents, model, optimizer=None, scheduler=None, epoch=None, loss_log=None):
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     if contents in {'model', 'rlmodel'}:
@@ -1669,13 +1419,9 @@ def my_parse_args():
         help='Comma-separated extra trainable modules to save with LoRA. Use auto/none.',
     )
 
-    parser.add_argument('--mode', default='training', choices=['training', 'testing', 'optimizing'])
+    parser.add_argument('--mode', default='training', choices=['training', 'rl'])
     parser.add_argument('--accelerate', action='store_true')
     parser.add_argument('--mixed_precision', default='no', choices=['no', 'fp16', 'bf16'])
-
-    parser.add_argument('--test_proportion', type=float, default=1.0)
-    parser.add_argument('--test_split', default='test')
-    parser.add_argument('--test_top_k', type=int, default=0)
 
     parser.add_argument('--result_root', default='./results/')
     parser.add_argument('--save_frequency', type=int, default=1)
@@ -1689,11 +1435,12 @@ def my_parse_args():
     parser.add_argument('--override_warm_up', type=int, default=0)
 
     parser.add_argument('--experiment_root', default='./results/experiments/')
-    parser.add_argument('--optim_experiment_root', default='./results/optim_experiments/')
+    parser.add_argument('--rl_experiment_root', default='./results/rl_experiments/')
     parser.add_argument('--experiment_name', default='')
     parser.add_argument('--comparison_samples', type=int, default=3)
     parser.add_argument('--comparison_frequency', type=int, default=1)
     parser.add_argument('--comparison_console', type=str2bool, default=True)
+    parser.add_argument('--comparison_random', type=str2bool, default=False)
     parser.add_argument('--train_log_every', type=int, default=5000)
     parser.add_argument('--progress_bar', type=str2bool, default=False)
     parser.add_argument('--intra_epoch_eval_every', type=int, default=5000)
@@ -1711,15 +1458,11 @@ def my_parse_args():
     parser.add_argument(
         '--train_stage',
         default='logic',
-        choices=['logic', 'stage2_loop'],
+        choices=['logic', 'stage2'],
     )
     parser.add_argument('--result_top_k', type=int, default=3)
 
     parser.add_argument('--pattern_path', type=str, default='./metadata/pattern_filtered.csv')
-    parser.add_argument(
-        '--exclude_condition_types',
-        default=','.join(sorted(DEFAULT_EXCLUDED_CONDITION_TYPES)),
-    )
 
     parser.add_argument('--rl_resume_epoch', type=int, default=0)
     parser.add_argument('--rl_proportion', type=float, default=1.0)
@@ -1727,9 +1470,7 @@ def my_parse_args():
     parser.add_argument('--rl_search_split', default='train')
     parser.add_argument('--rl_lr', type=float, default=1e-6)
     parser.add_argument('--rl_use_peft', action='store_true')
-    parser.add_argument('--rl_factor', type=str, default='[1.0, 1.0, 1.0, 1.0]')
     parser.add_argument('--rl_max_steps', type=int, default=-1)
-    parser.add_argument('--rl_num_generations', type=int, default=4)
     parser.add_argument('--rl_max_prompt_length', type=int, default=128)
     parser.add_argument('--rl_max_completion_length', type=int, default=128)
     parser.add_argument('--rl_max_action_steps', type=int, default=3)
@@ -1741,10 +1482,6 @@ def my_parse_args():
     parser.add_argument('--rl_grad_clip', type=float, default=1.0)
     parser.add_argument('--rl_logging_steps', type=int, default=10)
     parser.add_argument('--rl_save_steps', type=int, default=100)
-    parser.add_argument('--rl_log_completions', action='store_true')
-    parser.add_argument('--rl_report_to', default='none')
-    parser.add_argument('--rl_init_kl_coef', type=float, default=0.2)
-    parser.add_argument('--rl_cliprange', type=float, default=0.2)
 
     parser.add_argument('--MAX_STAGE1_BATCHES', type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--MAX_STAGE2_BATCHES', type=int, default=None, help=argparse.SUPPRESS)
@@ -1757,7 +1494,7 @@ def my_parse_args():
 
     if args.train_stage == 'logic' and args.MAX_STAGE1_BATCHES is not None:
         args.max_train_batches = args.MAX_STAGE1_BATCHES
-    if args.train_stage == 'stage2_loop' and args.MAX_STAGE2_BATCHES is not None:
+    if args.train_stage == 'stage2' and args.MAX_STAGE2_BATCHES is not None:
         args.max_train_batches = args.MAX_STAGE2_BATCHES
     if args.MAX_VALID_BATCHES is not None:
         args.max_valid_batches = args.MAX_VALID_BATCHES
@@ -1767,7 +1504,6 @@ def my_parse_args():
 
 def main():
     args = my_parse_args()
-    args.exclude_condition_types = normalize_condition_type_list(args.exclude_condition_types)
     print(f'args:\n{args}\n')
 
     random.seed(args.seed)
@@ -1785,7 +1521,7 @@ def main():
 
     pattern_filtered = pd.read_csv(args.pattern_path, index_col='id')
 
-    if args.accelerate and args.mode != 'optimizing':
+    if args.accelerate and args.mode != 'rl':
         if Accelerator is None:
             raise ImportError('accelerate is not installed. Please install it or run without --accelerate.')
         mixed_precision = None if args.mixed_precision == 'no' else args.mixed_precision
@@ -1810,8 +1546,6 @@ def main():
             splits.append('valid')
         except FileNotFoundError:
             print('# Warning: valid split not found yet, training will use train split only.')
-    elif args.mode == 'testing':
-        splits = [args.test_split]
     else:
         splits = ['train']
         if args.rl_search_split not in splits:
@@ -1827,7 +1561,7 @@ def main():
         graph_samplers = None
 
     dataset_train_stage = args.train_stage
-    if args.mode == 'optimizing' and args.train_stage == 'stage2_loop':
+    if args.mode == 'rl' and args.train_stage == 'stage2':
         # Rollout RL starts from raw OBS and lets the model decide ACTION/DSL.
         # Do not expand Stage 2 SFT prefixes for the RL dataset.
         dataset_train_stage = 'logic'
@@ -1841,7 +1575,6 @@ def main():
         max_rows_by_split={
             'train': args.max_train_rows,
             'valid': args.max_valid_rows,
-            args.test_split: args.max_valid_rows if args.mode == 'testing' else 0,
         },
         kg=kg,
         source_text_field=DEFAULT_SOURCE_TEXT_FIELD,
@@ -1854,26 +1587,7 @@ def main():
         result_top_k=args.result_top_k,
     )
 
-    # if args.exclude_condition_types:
-    #     for split in list(dataset_dict.keys()):
-    #         before_count = len(dataset_dict[split])
-    #         dataset_dict[split] = filter_dataset_by_excluded_condition_types(
-    #             dataset_dict[split],
-    #             excluded_condition_types=args.exclude_condition_types,
-    #         )
-    #         after_count = len(dataset_dict[split])
-    #         if after_count != before_count:
-    #             print(
-    #                 f'# Filtered split "{split}" by excluded condition types '
-    #                 f'{args.exclude_condition_types}: {before_count} -> {after_count}'
-    #             )
-
-    if args.mode == 'testing' and args.test_proportion < 1:
-        nrows = dataset_dict[args.test_split].shape[0]
-        selected = random.sample(range(nrows), int(nrows * args.test_proportion))
-        dataset_dict[args.test_split] = dataset_dict[args.test_split].select(selected)
-
-    if args.mode == 'optimizing' and args.rl_proportion < 1:
+    if args.mode == 'rl' and args.rl_proportion < 1:
         nrows = dataset_dict['train'].shape[0]
         selected = random.sample(range(nrows), int(nrows * args.rl_proportion))
         dataset_dict['train'] = dataset_dict['train'].select(selected)
@@ -1881,7 +1595,7 @@ def main():
     dataloader_dict = new_create_dataloader(
         dataset_dict=dataset_dict,
         batch_size=args.batch_size,
-        drop_last=(args.mode == 'optimizing'),
+        drop_last=(args.mode == 'rl'),
         num_workers=args.dataloader_num_workers,
         pin_memory=args.dataloader_pin_memory,
         persistent_workers=args.dataloader_persistent_workers,
@@ -1924,7 +1638,7 @@ def main():
             config_dataloader=config_dataloader,
             device=device,
         )
-    elif args.mode == 'optimizing':
+    elif args.mode == 'rl':
         experiment_record = prepare_rl_experiment_record(
             args=args,
             dataset_dict=dataset_dict,
@@ -1972,22 +1686,6 @@ def main():
             kg=kg,
             experiment_record=experiment_record,
         )
-    elif args.mode == 'testing':
-        test_loop(
-            args=args,
-            dataloader=dataloader_dict[args.test_split],
-            model=model,
-            tokenizer=tokenizer,
-            graph_samplers=graph_samplers,
-            pattern_filtered=pattern_filtered,
-            searching_split=args.test_split,
-            resume_epoch=args.rl_resume_epoch if args.rl_resume_epoch != 0 else args.resume_epoch,
-            src_len=src_len,
-            tgt_len=tgt_len,
-            kg=kg,
-            device=device,
-            accelerator=accelerator if args.accelerate else None,
-        )
     else:
         log_prediction_comparisons(
             args=args,
@@ -2001,27 +1699,15 @@ def main():
             log_path=experiment_record['paths']['comparison_log_path'],
             stage_label='before_rl',
         )
-        if args.train_stage == 'stage2_loop':
-            trainer_result = optimize_rollout_policy(
-                args=args,
-                dataset=dataset_dict['train'],
-                model=model,
-                tokenizer=tokenizer,
-                graph_samplers=graph_samplers,
-                kg=kg,
-                experiment_record=experiment_record,
-            )
-        else:
-            trainer_result = optimize_grpo(
-                args=args,
-                dataset=dataset_dict['train'],
-                model=model,
-                tokenizer=tokenizer,
-                graph_samplers=graph_samplers,
-                kg=kg,
-                batch_size=args.batch_size,
-                experiment_record=experiment_record,
-            )
+        trainer_result = optimize_rollout_policy(
+            args=args,
+            dataset=dataset_dict['train'],
+            model=model,
+            tokenizer=tokenizer,
+            graph_samplers=graph_samplers,
+            kg=kg,
+            experiment_record=experiment_record,
+        )
         log_prediction_comparisons(
             args=args,
             dataset_dict=dataset_dict,

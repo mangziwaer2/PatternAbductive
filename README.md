@@ -1,262 +1,129 @@
 # PatternAbductive
 
-Minimal runnable pipeline for KG abduction with executable DSL and tool-calling supervision.
+This project trains a text-to-text abductive reasoning model over a KG. The current codebase keeps only the three-step pipeline:
 
-## Data
+1. sample compact abductive data with graph-tool traces;
+2. Stage 1 SFT: `OBS -> PATTERN + DSL`;
+3. Stage 2 SFT: `OBS + ACTION/RESULT history -> next ACTION or final DSL`;
+4. RL: stream from `OBS`, execute KG tools when a complete ACTION block appears, append RESULT, and reward the final DSL.
 
-Convert the existing surface dataset without re-sampling:
+## Text Format
 
-```bash
-conda run -n patternabductive python scripts/convert_surface_to_abduction.py ^
-  --input-root ./sampled_data_surface/ ^
-  --output-root ./sampled_data_abduction/ ^
-  --splits train,valid,test ^
-  --result-top-k 3 ^
-  --max-observation-entities 8 ^
-  --trace-mode lazy ^
-  --overwrite
+Training and rollout use explicit boundaries:
+
+```text
+OBS [entity_a] [entity_b]
+<ACTION>
+ACTION FIND_COMMON TARGETS [entity_a] [entity_b] TOP_K 3
+</ACTION>
+<RESULT>
+RESULT
+[candidate] --[+relation]--> [entity_a]
+[candidate] --[+relation]--> [entity_b]
+</RESULT>
+<DSL>
+DSL AND(PROJ([+relation], ENT([entity_a])), PROJ([+relation], ENT([entity_b])))
+</DSL>
 ```
 
-For fast Stage 2 SFT, prefill `stage2_trace` once and train from the traced root:
+`RESULT` is deliberately compact: only the marker line and subgraph edge lines are kept. It does not include coverage, candidate summaries, or mode fields.
+
+## Sampling
+
+Generate the dataset directly with `sampling.py`:
 
 ```bash
-conda run -n patternabductive python scripts/hydrate_stage2_traces.py ^
-  --input-root ./sampled_data_abduction/ ^
-  --output-root ./sampled_data_abduction_traced/ ^
-  --splits train,valid,test ^
-  --result-top-k 3 ^
-  --trace-cache-size 100000 ^
-  --rebuild ^
-  --overwrite
-```
-
-Validate that each gold `logic_dsl` can explain its `OBS` on the matching KG split:
-
-```bash
-conda run -n patternabductive python scripts/validate_abduction_dataset.py ^
-  --data-root ./sampled_data_abduction_traced/ ^
-  --splits train,valid,test ^
-  --min-obs-recall 1.0 ^
-  --diagnose-splits train,valid,test ^
-  --overwrite
-```
-
-To write a filtered copy for reward-sensitive Stage 3 experiments, add an output root:
-
-```bash
-conda run -n patternabductive python scripts/validate_abduction_dataset.py ^
-  --data-root ./sampled_data_abduction_traced/ ^
-  --output-root ./sampled_data_abduction_checked/ ^
-  --splits train,valid,test ^
-  --min-obs-recall 1.0 ^
-  --overwrite
-```
-
-Or sample the target format directly:
-
-```bash
-conda run -n patternabductive python sampling.py ^
-  --data_root ./sampled_data_abduction/ ^
-  --result-top-k 3 ^
-  --max-answer-size 8 ^
+python sampling.py \
+  --data_root ./sampled_data_abduction/ \
+  --dataname DBpedia50 \
+  --result-top-k 3 \
+  --condition-samples-per-query 0 \
   --restart
 ```
 
-The target JSONL keeps only:
-
-```text
-pattern_str
-observation_text
-logic_dsl
-stage2_trace
-```
-
-`sampled_data_abduction/` may keep `stage2_trace` empty for quick conversion. `sampled_data_abduction_traced/` stores the same compact rows with precomputed ACTION/RESULT trace, so Stage 2 no longer calls the KG during SFT preprocessing.
-
-Current ACTION schema:
-
-```text
-ACTION FIND_COMMON TARGETS [...] TOP_K k
-ACTION FIND_ALTERNATIVE TARGETS [...] TOP_K k
-ACTION FIND_EXCLUSION TARGETS [...] TOP_K k
-ACTION EXPAND TARGETS [...] DIRECTION backward|forward TOP_K k
-ACTION CHECK_COVERAGE CANDIDATES [...] OBS [...] TOP_K k
-```
-
-Multi-hop supervision is represented by repeated one-hop actions. For example, a two-hop branch is trained as `FIND_* -> EXPAND -> CHECK_COVERAGE -> DSL`, not as a single oracle `MAX_HOPS 2` request.
-
-## Stage 1
+For a small local preview:
 
 ```bash
-conda run -n patternabductive python training.py ^
-  --data_root ./sampled_data_abduction_traced/ ^
-  --train_stage logic ^
-  --modelname GPT2_6_act_nt ^
-  --dataset_num_proc 8 ^
-  --dataloader_num_workers 4 ^
-  --dataloader_pin_memory true
+python sampling.py \
+  --data_root ./sampled_data_smoke/ \
+  --dataname DBpedia50 \
+  --max-patterns-per-split 2 \
+  --train-samples-per-pattern 2 \
+  --valid-samples-per-pattern 1 \
+  --test-samples-per-pattern 1 \
+  --condition-samples-per-query 0 \
+  --restart
 ```
 
-## Stage 2
+Each JSONL row contains:
+
+- `pattern_str`
+- `observation_text`
+- `logic_dsl`
+- `stage2_trace`
+
+## Stage 1 SFT
+
+Stage 1 teaches the model the symbolic output format. The target includes both pattern abstraction and executable DSL:
 
 ```bash
-conda run -n patternabductive python training.py ^
-  --data_root ./sampled_data_abduction_traced/ ^
-  --train_stage stage2_loop ^
-  --resume_epoch <stage1_epoch> ^
-  --modelname GPT2_6_act_nt ^
-  --dataset_num_proc 8 ^
-  --dataloader_num_workers 4 ^
-  --dataloader_pin_memory true
-```
-
-## Stage 3
-
-```bash
-conda run -n patternabductive python training.py ^
-  --mode optimizing ^
-  --data_root ./sampled_data_abduction_traced/ ^
-  --train_stage stage2_loop ^
-  --modelname GPT2_6_act_nt ^
-  --resume_epoch <stage2_epoch> ^
-  --rl_max_steps 100 ^
-  --rl_logging_steps 10
-```
-
-Stage 3 now enters through `training.py --mode optimizing`. For `--train_stage stage2_loop`, it does full rollout RL from `OBS`; it does not use dataset action traces as targets. If the model emits `ACTION`, KG is called and `RESULT` is appended. If it emits `DSL`, the rollout stops and the executable DSL is scored against the input OBS.
-
-Rollout evaluation:
-
-```bash
-conda run -n patternabductive python scripts/run_stage3_rollout_eval.py ^
-  --data_root ./sampled_data_abduction_traced/ ^
-  --resume_epoch <stage2_or_rl_epoch> ^
-  --max-rows 20
-```
-
-## Checkpoint Inference
-
-Test a downloaded checkpoint locally with a single observation. Stage 1 checkpoints generate `PATTERN + DSL` directly:
-
-```bash
-conda run -n patternabductive python scripts/test_checkpoint_inference.py ^
-  --stage logic ^
-  --modelname Qwen2.5-0.5B ^
-  --checkpoint-path ./downloaded_ckpt/DBpedia50-default-8-1-text2text.pth ^
-  --observation "OBS [Augustin de Lespinasse]" ^
-  --disable-text-extra-tokens
-```
-
-Stage 2 checkpoints run the tool loop. The model emits `ACTION`, the script executes the KG tool, appends `RESULT`, and repeats until `DSL` or `--max-action-steps`:
-
-```bash
-conda run -n patternabductive python scripts/test_checkpoint_inference.py ^
-  --stage stage2_loop ^
-  --modelname Qwen2.5-0.5B ^
-  --checkpoint-path ./downloaded_ckpt/DBpedia50-default-8-2-text2text.pth ^
-  --observation "OBS [Augustin de Lespinasse]" ^
-  --graph-split train ^
-  --max-action-steps 3 ^
-  --disable-text-extra-tokens ^
-  --print-raw
-```
-
-For LoRA checkpoints, keep the `.pth.adapter/` directory next to the `.pth` file.
-
-## Training Speed
-
-The current minimal speed path is:
-
-```text
-1. Hydrate stage2_trace once.
-2. Let utils/dataloader.py expand trace into prefix-to-next-step samples.
-3. Save the expanded HuggingFace dataset cache under dataset_cache/.
-4. Reuse the processed cache on later runs with the same data_root, train_stage, ACTION schema, top_k, and max_rows.
-5. Use dataset_num_proc for HF map and dataloader_num_workers/pin_memory for batch loading.
-6. Skip KG loading automatically during SFT when logic_dsl/stage2_trace already exist.
-7. Use --accelerate --mixed_precision fp16 or bf16 on cloud GPUs that support it.
-```
-
-Kaggle notebook cells can call `training.py` directly. Use `--lora_modules_to_save none` and `--disable_text_extra_tokens` for lightweight LoRA; otherwise embedding/lm_head can dominate the trainable parameter count.
-
-Stage 1:
-
-```bash
-!python training.py \
-  --batch_size 4 \
-  --data_root "/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction_traced" \
-  --modelname "Qwen2.5-0.5B" \
+python training.py \
+  --mode training \
   --train_stage logic \
-  --override_nepoch 1 \
-  --max_train_rows 0 \
-  --max_valid_rows 0 \
-  --max_train_batches 2000 \
-  --max_valid_batches 100 \
-  --result_top_k 3 \
-  --accelerate \
-  --mixed_precision "fp16" \
-  --experiment_name stage1-logic \
-  --dataset_num_proc 4 \
-  --dataloader_num_workers 4 \
-  --dataloader_pin_memory true \
-  --dataloader_persistent_workers true \
-  --train_log_every 100 \
-  --save_frequency 1 \
-  --use_peft \
-  --lora_r 8 \
-  --lora_alpha 16 \
-  --lora_modules_to_save none \
-  --disable_text_extra_tokens \
-  --override_lr 1e-4 \
-  --override_warm_up 100
-```
-
-Stage 2:
-
-```bash
-!python training.py \
+  --data_root ./sampled_data_abduction/ \
+  --dataname DBpedia50 \
+  --modelname Qwen2.5-0.5B \
   --batch_size 4 \
-  --data_root "/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction_traced" \
-  --modelname "Qwen2.5-0.5B" \
-  --train_stage stage2_loop \
-  --resume_epoch 1 \
-  --checkpoint-path "/kaggle/input/stage1-logic-ckpt/DBpedia50-default-8-1-text2text.pth" \
-  --override_nepoch 2 \
-  --max_train_rows 0 \
-  --max_valid_rows 0 \
-  --max_train_batches 3000 \
-  --max_valid_batches 100 \
-  --result_top_k 3 \
-  --accelerate \
-  --mixed_precision "fp16" \
-  --experiment_name stage2-action-loop \
-  --dataset_num_proc 4 \
-  --dataloader_num_workers 4 \
-  --dataloader_pin_memory true \
-  --dataloader_persistent_workers true \
-  --train_log_every 100 \
-  --save_frequency 1 \
+  --override_nepoch 1 \
   --use_peft \
-  --lora_r 8 \
-  --lora_alpha 16 \
   --lora_modules_to_save none \
-  --disable_text_extra_tokens \
-  --override_lr 1e-4 \
-  --override_warm_up 100
+  --disable_text_extra_tokens
 ```
 
-`--checkpoint-path` is optional when the checkpoint is already under `./ckpt/<modelname>/`.
-On Kaggle it is useful after downloading/uploading Stage 1 output as a dataset under `/kaggle/input`.
-For LoRA checkpoints, upload both the `.pth` file and the sibling `.pth.adapter/` directory.
+## Stage 2 SFT
 
-Set `--max_train_batches 0` only when intentionally running the full split.
-
-## Model Switch
-
-Local smoke tests use `GPT2_6_act_nt`. Cloud runs can switch models through:
+Stage 2 trains tool-use continuation. The dataloader expands each `stage2_trace` into prefix-to-next-step samples:
 
 ```bash
---modelname Qwen2.5-0.5B --config-model configs/config-model.yml
+python training.py \
+  --mode training \
+  --train_stage stage2 \
+  --data_root ./sampled_data_abduction/ \
+  --dataname DBpedia50 \
+  --modelname Qwen2.5-0.5B \
+  --resume_epoch 1 \
+  --batch_size 4 \
+  --override_nepoch 1 \
+  --use_peft \
+  --lora_modules_to_save none \
+  --disable_text_extra_tokens
 ```
 
-Model entries live in `configs/config-model.yml`.
+The training task is still one pipeline: given the current context, predict the next model segment. During inference/RL, the tool loop runs after a complete `</ACTION>` is generated.
+
+## Rollout RL
+
+RL starts from `OBS` only. The model streams tokens until `</ACTION>` or `</DSL>`:
+
+- `</ACTION>`: parse ACTION, execute KG tool, append `<RESULT>...</RESULT>`, then continue.
+- `</DSL>`: stop rollout and score the DSL by parse/execution quality and answer-set overlap.
+
+```bash
+python training.py \
+  --mode rl \
+  --train_stage stage2 \
+  --data_root ./sampled_data_abduction/ \
+  --dataname DBpedia50 \
+  --modelname Qwen2.5-0.5B \
+  --resume_epoch 1 \
+  --rl_max_steps 100 \
+  --rl_max_action_steps 3 \
+  --rl_max_completion_length 128
+```
+
+## Notes
+
+- `--checkpoint-path` can point directly to a downloaded Kaggle checkpoint or checkpoint directory.
+- `--max_train_rows` limits the first rows loaded for a run; it is not per-epoch random resampling.
+- `--max_train_batches` is useful for smoke experiments.
+- Keep `ckpt/` for local checkpoints; generated `results/` and `dataset_cache/` can be removed when you need a clean run.

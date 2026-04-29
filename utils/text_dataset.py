@@ -7,18 +7,38 @@ from utils.action_supervision import (
 )
 from utils.kg_actions import execute_action_text
 from utils.logic_dsl import surface_query_to_dsl
+from utils.evidence import RESULT_END_TAG, RESULT_START_TAG, strip_result_tags
 from utils.textualization import attach_textual_fields, tokenize_surface_text
 
 
 def extract_candidate_targets(result_text: str, top_k: int = 10) -> list[str]:
     targets = []
-    for line in str(result_text).splitlines():
+    for line in strip_result_tags(result_text).splitlines():
+        if line in {RESULT_START_TAG, RESULT_END_TAG, 'RESULT'}:
+            continue
         tokens = tokenize_surface_text(line)
-        if len(tokens) >= 2 and tokens[0] == 'CANDIDATE':
-            targets.append(tokens[1])
+        if len(tokens) >= 5 and tokens[1] == '--' and tokens[3] == '-->':
+            targets.append(tokens[0])
         if len(targets) >= top_k:
             break
-    return targets
+    deduped = []
+    seen = set()
+    for target in targets:
+        if target in seen:
+            continue
+        seen.add(target)
+        deduped.append(target)
+    return deduped
+
+
+def result_has_edges(result_text: str) -> bool:
+    for line in strip_result_tags(result_text).splitlines():
+        if line in {RESULT_START_TAG, RESULT_END_TAG, 'RESULT'}:
+            continue
+        tokens = tokenize_surface_text(line)
+        if len(tokens) >= 5 and tokens[1] == '--' and tokens[3] == '-->':
+            return True
+    return False
 
 
 def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
@@ -28,7 +48,6 @@ def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
     branch_hops = infer_branch_hops(pattern_str)
     steps = max(branch_hops, default=infer_action_steps(pattern_str))
     trace = []
-    all_candidates = []
 
     if targets:
         action = render_action_text(
@@ -37,12 +56,13 @@ def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
             top_k=top_k,
         )
         result = execute_action_text(action, kg=kg, graph_split=graph_split)
+        if not result_has_edges(result):
+            return []
         trace.append({
             'action': action,
             'result': result,
         })
         targets = extract_candidate_targets(result, top_k=top_k)
-        all_candidates.extend(targets)
 
     for _ in range(2, steps + 1):
         if not targets:
@@ -54,35 +74,13 @@ def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
             top_k=top_k,
         )
         result = execute_action_text(action, kg=kg, graph_split=graph_split)
+        if not result_has_edges(result):
+            break
         trace.append({
             'action': action,
             'result': result,
         })
         targets = extract_candidate_targets(result, top_k=top_k)
-        all_candidates.extend(targets)
-
-    coverage_candidates = []
-    seen = set()
-    for candidate in all_candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        coverage_candidates.append(candidate)
-        if len(coverage_candidates) >= top_k:
-            break
-
-    if coverage_candidates and observation_targets:
-        action = render_action_text(
-            action_type='CHECK_COVERAGE',
-            candidates=coverage_candidates,
-            obs=observation_targets,
-            top_k=top_k,
-        )
-        result = execute_action_text(action, kg=kg, graph_split=graph_split)
-        trace.append({
-            'action': action,
-            'result': result,
-        })
 
     return trace
 
@@ -106,6 +104,8 @@ def build_minimal_text_record(
             graph_split=graph_split,
             top_k=result_top_k,
         )
+        if not stage2_trace:
+            return None
 
     return {
         'pattern_str': record['pattern_str'],

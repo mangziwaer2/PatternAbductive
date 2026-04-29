@@ -20,7 +20,6 @@ TEXT_EXTRA_TOKENS = [
     *DSL_CONTROL_TOKENS,
     *ACTION_CONTROL_TOKENS,
     *EVIDENCE_CONTROL_TOKENS,
-    'NO_CANDIDATES',
 ]
 
 
@@ -166,14 +165,6 @@ def extract_text_sample_to_device(
     source_attention_mask = source_tokenized.attention_mask
 
     return source, target, pattern_id, input_ids, attention_mask, labels, source_attention_mask, condition_text
-
-
-def source_to_prompt(example):
-    condition_text = example.get('condition_text', '')
-    prompt = build_conditioned_source([example['source']], [condition_text])[0]
-    enriched = dict(example)
-    enriched['prompt'] = prompt
-    return enriched
 
 
 def new_extract_sample_to_device(device, sample, tokenizer, src_len, tgt_len, is_gen: bool):
