@@ -1,6 +1,5 @@
 from utils.action_scoring import score_action_text
 from utils.execution import compute_answer_set_scores, execute_logic_text
-from utils.text_scoring import score_text_query_prediction
 from utils.textualization import observation_text_to_answer_ids
 from utils.tool_loop import extract_action_text, extract_dsl_text
 
@@ -31,9 +30,7 @@ def score_action_completion(completion: str, target: str, source: str, kg, graph
 
 def score_logic_completion(
         completion: str,
-        target: str,
         source: str,
-        condition_text: str,
         kg,
         graph_samplers,
         graph_split: str = 'train') -> dict:
@@ -61,23 +58,6 @@ def score_logic_completion(
     )
     complexity_penalty = min(execution['query_complexity'] / 50.0, 1.0)
 
-    diagnostic = {'smatch': 0.0, 'gold_pattern_match': 0.0}
-    if target:
-        try:
-            text_score = score_text_query_prediction(
-                completion=dsl_text,
-                target=target,
-                source=observation_text,
-                condition_text=condition_text,
-                kg=kg,
-                graph_samplers=graph_samplers,
-                searching_split=graph_split,
-            )
-            diagnostic['smatch'] = float(text_score.get('smatch', 0.0))
-            diagnostic['gold_pattern_match'] = float(text_score.get('validity', 0.0))
-        except Exception:
-            pass
-
     reward = (
         0.5 * execution['parse_success']
         + 0.5 * execution['execution_success']
@@ -91,7 +71,6 @@ def score_logic_completion(
         'target_type': 'dsl',
         **execution,
         **answer_scores,
-        **diagnostic,
         'validity': float(execution['parse_success'] * execution['execution_success']),
         'jaccard': answer_scores['answer_jaccard'],
         'dice': answer_scores['answer_dice'],
@@ -104,7 +83,6 @@ def score_logic_completion(
 
 def score_rollout_trajectory(
         rollout: dict,
-        target: str,
         observation_text: str,
         kg,
         graph_samplers,
@@ -129,9 +107,7 @@ def score_rollout_trajectory(
 
     logic_score = score_logic_completion(
         completion=rollout.get('dsl', ''),
-        target=target,
         source=context,
-        condition_text='',
         kg=kg,
         graph_samplers=graph_samplers,
         graph_split=graph_split,
@@ -166,4 +142,3 @@ def score_rollout_trajectory(
         'stage3_reward': float(trajectory_reward),
         'logic_stage3_reward': float(logic_score['stage3_reward']),
     }
-

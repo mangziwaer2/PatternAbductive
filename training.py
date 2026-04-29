@@ -649,29 +649,15 @@ def log_prediction_comparisons(
             emit_text_log('', log_path, also_print=args.comparison_console)
 
 
-def _extract_dsl_target_text(target: str) -> str:
-    text = str(target or '').strip()
-    tagged_dsl = extract_dsl_text(text)
-    if tagged_dsl is not None:
-        return tagged_dsl
-    if ' DSL ' in text:
-        return text.split(' DSL ', 1)[1].strip()
-    if text.startswith('DSL '):
-        return text[len('DSL '):].strip()
-    return text
-
-
 def _rollout_records_from_dataset(dataset):
     records = []
     for row in dataset:
         observation = str(row.get('observation_text') or row.get('source') or '').strip()
         if observation and not observation.startswith('OBS '):
             observation = 'OBS ' + observation
-        target = _extract_dsl_target_text(row.get('logic_dsl') or row.get('target') or '')
         if observation:
             records.append({
                 'observation_text': observation,
-                'logic_dsl': target,
             })
     return records
 
@@ -842,7 +828,6 @@ def optimize_rollout_policy(args, dataset, model, tokenizer, graph_samplers, kg,
         rollout = rollout_once(model, tokenizer, kg, record, device, args)
         score = score_rollout_trajectory(
             rollout=rollout,
-            target=record.get('logic_dsl', ''),
             observation_text=record['observation_text'],
             kg=kg,
             graph_samplers=graph_samplers,
