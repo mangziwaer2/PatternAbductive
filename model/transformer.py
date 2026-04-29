@@ -7,14 +7,46 @@ from transformers import AutoConfig, AutoModelForCausalLM, GPT2Config, GPT2LMHea
 GPT2_MODEL_PATH = str('gpt2')
 
 
+def _path_if_local(path_value: str) -> str:
+    path = Path(str(path_value)).expanduser()
+    return str(path) if path.exists() else str(path_value)
+
+
+def _local_model_dir_for_name(model_name: str) -> str:
+    candidates = [
+        Path(str(model_name)).expanduser(),
+        Path(__file__).resolve().parents[1] / str(model_name),
+    ]
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / 'config.json').exists():
+            return str(candidate)
+    return ''
+
+
 def resolve_model_runtime_config(model_name: str, config_model: dict | None = None) -> dict:
     if not config_model:
-        return {}
-    if model_name in config_model:
-        return dict(config_model[model_name] or {})
-    if 'default' in config_model:
-        return dict(config_model['default'] or {})
-    return {}
+        runtime_config = {}
+    elif model_name in config_model:
+        runtime_config = dict(config_model[model_name] or {})
+    elif 'default' in config_model:
+        runtime_config = dict(config_model['default'] or {})
+    else:
+        runtime_config = {}
+
+    local_model_dir = _local_model_dir_for_name(model_name)
+    if local_model_dir:
+        pretrained_path = str(runtime_config.get('pretrained_model_path', '') or '')
+        tokenizer_path = str(runtime_config.get('tokenizer_path', '') or '')
+        if not pretrained_path or '/' in pretrained_path or not Path(pretrained_path).expanduser().exists():
+            runtime_config['pretrained_model_path'] = local_model_dir
+        if not tokenizer_path or '/' in tokenizer_path or not Path(tokenizer_path).expanduser().exists():
+            runtime_config['tokenizer_path'] = local_model_dir
+
+    for key in ['pretrained_model_path', 'tokenizer_path']:
+        if key in runtime_config:
+            runtime_config[key] = _path_if_local(runtime_config[key])
+
+    return runtime_config
 
 
 def get_tokenizer_path(model_runtime_config: dict | None = None) -> str:
@@ -33,7 +65,7 @@ def create_transformer(ntoken: int, special_tokens: dict,
         model_runtime_config: dict | None = None):
     model_runtime_config = model_runtime_config or {}
     architecture = str(model_runtime_config.get('architecture', 'gpt2')).lower()
-    pretrained_model_path = str(model_runtime_config.get('pretrained_model_path', GPT2_MODEL_PATH))
+    pretrained_model_path = _path_if_local(model_runtime_config.get('pretrained_model_path', GPT2_MODEL_PATH))
     trust_remote_code = bool(model_runtime_config.get('trust_remote_code', False))
     use_pretrained_weights = bool(use_pretrained_weights or model_runtime_config.get('use_pretrained_weights', False))
     config_overrides = dict(model_runtime_config.get('config_overrides') or {})

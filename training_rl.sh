@@ -1,0 +1,26 @@
+python training.py \
+  --batch_size 1 \
+  --checkpoint-path "/kaggle/input/models/mangziwaer2/qwenabductivestage1/pytorch/default/1/Qwen2.5-0.5B/" \
+  --data_root "/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction" \
+  --modelname "Qwen2.5-0.5B" \
+  --train_stage stage2 \
+  --mode rl \
+  --resume_epoch 3 \
+  --max_train_rows 0 \
+  --result_top_k 3 \
+  --experiment_name stage3-rl-smoke \
+  --dataset_num_proc 4 \
+  --dataloader_num_workers 0 \
+  --dataloader_pin_memory true \
+  --use_peft \
+  --lora_r 8 \
+  --lora_alpha 16 \
+  --lora_modules_to_save none \
+  --disable_text_extra_tokens \
+  --rl_lr 1e-6 \
+  --rl_epochs 1 \
+  --rl_max_steps 10000 \
+  --rl_max_action_steps 6 \
+  --rl_max_completion_length 128 \
+  --rl_logging_steps 10 \
+  --rl_save_steps 100

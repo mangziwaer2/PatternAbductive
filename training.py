@@ -754,6 +754,58 @@ def rollout_once(model, tokenizer, kg, record, device, args):
     }
 
 
+@torch.no_grad()
+def log_rollout_comparisons(
+        args,
+        dataset,
+        model,
+        tokenizer,
+        kg,
+        device,
+        log_path,
+        stage_label):
+    if args.comparison_samples <= 0:
+        return
+
+    records = _rollout_records_from_dataset(dataset)
+    indices = select_sample_indices(
+        len(records),
+        args.comparison_samples,
+        randomize=args.comparison_random,
+        seed=args.seed + sum(ord(char) for char in stage_label),
+    )
+    model.eval()
+    emit_text_log('', log_path, also_print=args.comparison_console)
+    emit_text_log(f'===== {stage_label}_rollout =====', log_path, also_print=args.comparison_console)
+    emit_text_log(f'[rollout] logged_indices={indices}', log_path, also_print=args.comparison_console)
+
+    for record_index in indices:
+        record = records[record_index]
+        rollout = rollout_once(model, tokenizer, kg, record, device, args)
+        emit_text_log(f'[rollout] idx={record_index}', log_path, also_print=args.comparison_console)
+        emit_text_log(f'[rollout] OBS        : {record["observation_text"]}', log_path, also_print=args.comparison_console)
+        emit_text_log(f'[rollout] STOPPED_BY : {rollout.get("stopped_by", "")}', log_path, also_print=args.comparison_console)
+        for generation in rollout.get('raw_generations', []):
+            generated = str(generation.get('generated', '')).replace('\n', '\\n')
+            emit_text_log(
+                f'[rollout] GEN[{generation.get("step")}] : {generated}',
+                log_path,
+                also_print=args.comparison_console,
+            )
+            if generation.get('tool_error'):
+                emit_text_log(
+                    f'[rollout] TOOL_ERROR[{generation.get("step")}] : {generation.get("tool_error")}',
+                    log_path,
+                    also_print=args.comparison_console,
+                )
+        for history_index, history_text in enumerate(rollout.get('history', []), start=1):
+            label = 'ACTION' if history_index % 2 == 1 else 'RESULT'
+            compact = str(history_text).replace('\n', '\\n')
+            emit_text_log(f'[rollout] {label}[{history_index}] : {compact}', log_path, also_print=args.comparison_console)
+        emit_text_log(f'[rollout] DSL        : {rollout.get("dsl", "")}', log_path, also_print=args.comparison_console)
+        emit_text_log('', log_path, also_print=args.comparison_console)
+
+
 def _segment_ce_loss(model, tokenizer, segment, device):
     generated_ids = [
         token_id
@@ -862,6 +914,14 @@ def optimize_rollout_policy(args, dataset, model, tokenizer, graph_samplers, kg,
             'answer_precision': score.get('answer_precision', 0.0),
             'observation_text': record['observation_text'],
             'pred_dsl': rollout.get('dsl', ''),
+            'generated_segments': [
+                {
+                    'step': generation.get('step'),
+                    'generated': generation.get('generated', ''),
+                    'tool_error': generation.get('tool_error', ''),
+                }
+                for generation in rollout.get('raw_generations', [])
+            ],
         }
         with open(log_path, 'a', encoding='utf-8') as log_file:
             log_file.write(json.dumps(row, ensure_ascii=False) + '\n')
@@ -1675,15 +1735,13 @@ def main():
             experiment_record=experiment_record,
         )
     else:
-        log_prediction_comparisons(
+        log_rollout_comparisons(
             args=args,
-            dataset_dict=dataset_dict,
+            dataset=dataset_dict['train'],
             model=model,
             tokenizer=tokenizer,
-            src_len=src_len,
-            tgt_len=tgt_len,
+            kg=kg,
             device=device,
-            accelerator=None,
             log_path=experiment_record['paths']['comparison_log_path'],
             stage_label='before_rl',
         )
@@ -1696,15 +1754,13 @@ def main():
             kg=kg,
             experiment_record=experiment_record,
         )
-        log_prediction_comparisons(
+        log_rollout_comparisons(
             args=args,
-            dataset_dict=dataset_dict,
+            dataset=dataset_dict['train'],
             model=model,
             tokenizer=tokenizer,
-            src_len=src_len,
-            tgt_len=tgt_len,
+            kg=kg,
             device=device,
-            accelerator=None,
             log_path=experiment_record['paths']['comparison_log_path'],
             stage_label='after_rl',
         )

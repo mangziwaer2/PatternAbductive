@@ -1,4 +1,5 @@
 import torch
+from pathlib import Path
 from transformers import AddedToken, AutoTokenizer
 
 from utils.condition import CONDITION_TOKENS
@@ -38,6 +39,7 @@ def create_text_tokenizer(
     if extra_tokens is None:
         extra_tokens = get_text_extra_tokens(include_graph_tokens=False)
 
+    pretrained_model_path = str(Path(str(pretrained_model_path)).expanduser())
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_path,
         use_fast=True,

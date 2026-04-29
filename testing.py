@@ -256,13 +256,13 @@ def run_stage2_inference(model, tokenizer, kg, observation, device, args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--modelname', default='GPT2_6_act_nt')
+    parser.add_argument('--modelname', default="Qwen2.5-0.5B")
     parser.add_argument('--config-model', default='configs/config-model.yml')
     parser.add_argument('--dataname', default='DBpedia50')
     parser.add_argument('--scale', default='default')
     parser.add_argument('--max-answer-size', type=int, default=8)
     parser.add_argument('--checkpoint_root', default='./ckpt/')
-    parser.add_argument('--checkpoint-path', dest='checkpoint_path', default='')
+    parser.add_argument('--checkpoint-path', dest='checkpoint_path', default=r'E:\project\LLM\PatternAbductive\ckpt\Qwen2.5-0.5B')
     parser.add_argument('--checkpoint_contents', choices=['auto', 'model', 'rlmodel'], default='auto')
     parser.add_argument('--resume_epoch', type=int, default=0)
     parser.add_argument('--stage', choices=['logic', 'stage2'], default='stage2')
