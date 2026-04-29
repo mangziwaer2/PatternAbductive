@@ -1,6 +1,19 @@
-from utils.action_supervision import extract_observation_entity_tokens, render_action_text, VALID_ACTION_TYPES
-from utils.evidence import build_common_cause_evidence, render_evidence_package
+from utils.action_supervision import (
+    extract_observation_entity_tokens,
+    normalize_action_type,
+    render_action_text,
+    VALID_ACTION_TYPES,
+)
+from utils.evidence import (
+    build_candidate_coverage_evidence,
+    build_common_cause_evidence,
+    build_expand_evidence,
+    render_evidence_package,
+)
 from utils.textualization import tokenize_surface_text
+
+
+ACTION_FIELD_TOKENS = {'TARGETS', 'CANDIDATES', 'OBS', 'DIRECTION', 'TOP_K'}
 
 
 def parse_action_text(action_text: str) -> dict:
@@ -11,8 +24,11 @@ def parse_action_text(action_text: str) -> dict:
         raise ValueError(f'Missing action type: {action_text}')
 
     action = {
-        'action_type': tokens[1],
+        'action_type': normalize_action_type(tokens[1]),
         'targets': [],
+        'candidates': [],
+        'obs': [],
+        'direction': 'backward',
         'top_k': 10,
     }
     if action['action_type'] not in VALID_ACTION_TYPES:
@@ -21,13 +37,22 @@ def parse_action_text(action_text: str) -> dict:
     index = 2
     while index < len(tokens):
         token = tokens[index]
-        if token == 'TARGETS':
+        if token in {'TARGETS', 'CANDIDATES', 'OBS'}:
             index += 1
-            targets = []
-            while index < len(tokens) and tokens[index] != 'TOP_K':
-                targets.append(tokens[index])
+            values = []
+            while index < len(tokens) and tokens[index] not in ACTION_FIELD_TOKENS:
+                values.append(tokens[index])
                 index += 1
-            action['targets'] = targets
+            if token == 'TARGETS':
+                action['targets'] = values
+            elif token == 'CANDIDATES':
+                action['candidates'] = values
+            else:
+                action['obs'] = values
+            continue
+        if token == 'DIRECTION' and index + 1 < len(tokens):
+            action['direction'] = str(tokens[index + 1]).lower()
+            index += 2
             continue
         if token == 'TOP_K' and index + 1 < len(tokens):
             action['top_k'] = int(tokens[index + 1])
@@ -40,27 +65,78 @@ def parse_action_text(action_text: str) -> dict:
 
 def render_action(action: dict) -> str:
     return render_action_text(
-        action_type=action.get('action_type', 'FIND_COMMON_CAUSE'),
+        action_type=action.get('action_type', 'FIND_COMMON'),
         targets=action.get('targets', []),
+        candidates=action.get('candidates', []),
+        obs=action.get('obs', []),
+        direction=action.get('direction', 'backward'),
         top_k=int(action.get('top_k', 10)),
     )
 
 
 def execute_action(action: dict, kg, graph_split: str = 'train') -> dict:
-    action_type = action.get('action_type')
+    action_type = normalize_action_type(action.get('action_type'))
     if action_type not in VALID_ACTION_TYPES:
         raise ValueError(f'Unsupported action type: {action_type}')
 
-    targets = action.get('targets') or []
-    observation_text = 'OBS ' + ' '.join(targets)
+    top_k = int(action.get('top_k', 10))
 
-    return build_common_cause_evidence(
-        observation_text=observation_text,
-        kg=kg,
-        graph_split=graph_split,
-        top_k=int(action.get('top_k', 10)),
-        max_hops=1,
-    )
+    if action_type in {'FIND_COMMON', 'FIND_ALTERNATIVE', 'FIND_EXCLUSION'}:
+        targets = action.get('targets') or []
+        observation_text = 'OBS ' + ' '.join(targets)
+        # Fetch extra candidates for alternative/exclusion actions, then let
+        # rendering keep the requested top_k after action-specific ordering.
+        evidence = build_common_cause_evidence(
+            observation_text=observation_text,
+            kg=kg,
+            graph_split=graph_split,
+            top_k=top_k * 3 if action_type != 'FIND_COMMON' else top_k,
+            max_hops=1,
+        )
+        if action_type == 'FIND_ALTERNATIVE':
+            evidence['mode'] = 'find_alternative'
+            evidence['candidates'] = sorted(
+                evidence.get('candidates', []),
+                key=lambda item: (-item.get('coverage_num', 0), item.get('entity_id', 0)),
+            )[:top_k]
+        elif action_type == 'FIND_EXCLUSION':
+            evidence['mode'] = 'find_exclusion'
+            evidence['candidates'] = sorted(
+                evidence.get('candidates', []),
+                key=lambda item: (
+                    len(item.get('missing_ids', [])) == 0,
+                    -item.get('coverage_num', 0),
+                    len(item.get('missing_ids', [])),
+                    item.get('entity_id', 0),
+                ),
+            )[:top_k]
+        else:
+            evidence['mode'] = 'find_common'
+        return evidence
+
+    if action_type == 'EXPAND':
+        targets = action.get('targets') or []
+        observation_text = 'OBS ' + ' '.join(targets)
+        return build_expand_evidence(
+            target_text=observation_text,
+            kg=kg,
+            graph_split=graph_split,
+            top_k=top_k,
+            direction=action.get('direction', 'backward'),
+        )
+
+    if action_type == 'CHECK_COVERAGE':
+        candidate_text = 'OBS ' + ' '.join(action.get('candidates') or action.get('targets') or [])
+        observation_text = 'OBS ' + ' '.join(action.get('obs') or [])
+        return build_candidate_coverage_evidence(
+            candidate_text=candidate_text,
+            observation_text=observation_text,
+            kg=kg,
+            graph_split=graph_split,
+            top_k=top_k,
+        )
+
+    raise ValueError(f'Unsupported action type: {action_type}')
 
 
 def execute_action_text(action_text: str, kg, graph_split: str = 'train') -> str:
@@ -73,7 +149,7 @@ def build_default_action_from_observation(observation_text: str, top_k: int = 10
     del max_hops
     targets = extract_observation_entity_tokens(observation_text)
     return render_action({
-        'action_type': 'FIND_COMMON_CAUSE',
+        'action_type': 'FIND_COMMON',
         'targets': targets,
         'top_k': top_k,
     })

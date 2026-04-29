@@ -1,5 +1,6 @@
 from utils.action_supervision import (
     extract_observation_entity_tokens,
+    infer_branch_hops,
     infer_action_steps,
     infer_action_type,
     render_action_text,
@@ -22,13 +23,14 @@ def extract_candidate_targets(result_text: str, top_k: int = 10) -> list[str]:
 
 def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
     action_type = infer_action_type(pattern_str)
-    targets = extract_observation_entity_tokens(observation_text)
-    steps = infer_action_steps(pattern_str)
+    observation_targets = extract_observation_entity_tokens(observation_text)
+    targets = observation_targets[:]
+    branch_hops = infer_branch_hops(pattern_str)
+    steps = max(branch_hops, default=infer_action_steps(pattern_str))
     trace = []
+    all_candidates = []
 
-    for _ in range(steps):
-        if not targets:
-            break
+    if targets:
         action = render_action_text(
             action_type=action_type,
             targets=targets,
@@ -40,6 +42,47 @@ def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
             'result': result,
         })
         targets = extract_candidate_targets(result, top_k=top_k)
+        all_candidates.extend(targets)
+
+    for _ in range(2, steps + 1):
+        if not targets:
+            break
+        action = render_action_text(
+            action_type='EXPAND',
+            targets=targets,
+            direction='backward',
+            top_k=top_k,
+        )
+        result = execute_action_text(action, kg=kg, graph_split=graph_split)
+        trace.append({
+            'action': action,
+            'result': result,
+        })
+        targets = extract_candidate_targets(result, top_k=top_k)
+        all_candidates.extend(targets)
+
+    coverage_candidates = []
+    seen = set()
+    for candidate in all_candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        coverage_candidates.append(candidate)
+        if len(coverage_candidates) >= top_k:
+            break
+
+    if coverage_candidates and observation_targets:
+        action = render_action_text(
+            action_type='CHECK_COVERAGE',
+            candidates=coverage_candidates,
+            obs=observation_targets,
+            top_k=top_k,
+        )
+        result = execute_action_text(action, kg=kg, graph_split=graph_split)
+        trace.append({
+            'action': action,
+            'result': result,
+        })
 
     return trace
 

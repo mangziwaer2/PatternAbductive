@@ -80,6 +80,7 @@ def write_manifest(args, split_stats):
             'condition_text, condition_signature, kg_hints_text, and hypothesis_text are intentionally dropped.',
             'logic_dsl is derived from hypothesis_text.',
             'stage2_trace is generated eagerly when trace_mode=eager; otherwise dataloader derives it lazily.',
+            'stage2_trace uses graph-search ACTION/RESULT events: FIND_COMMON/FIND_ALTERNATIVE/FIND_EXCLUSION, EXPAND, CHECK_COVERAGE.',
             'dataloader derives Stage 1 and Stage 2 training samples from these compact fields.',
         ],
     }

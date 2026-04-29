@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODELNAME="${MODELNAME:-GPT2_6_act_nt}"
-DATA_ROOT="${DATA_ROOT:-./sampled_data_abduction_traced/}"
+DATA_ROOT="${DATA_ROOT:-./sampled_data_abduction/}"
 BATCH_SIZE="${BATCH_SIZE:-12}"
 DATASET_NUM_PROC="${DATASET_NUM_PROC:-16}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
@@ -14,6 +14,7 @@ STAGE1_CHECKPOINT_PATH="${STAGE1_CHECKPOINT_PATH:-}"
 STAGE2_EXTRA_EPOCHS="${STAGE2_EXTRA_EPOCHS:-${STAGE2_NEPOCH}}"
 STAGE2_FINAL_EPOCH="${STAGE2_FINAL_EPOCH:-$((STAGE1_EPOCH + STAGE2_EXTRA_EPOCHS))}"
 STAGE2_EPOCH="${STAGE2_EPOCH:-${STAGE2_FINAL_EPOCH}}"
+STAGE2_CHECKPOINT_PATH="${STAGE2_CHECKPOINT_PATH:-}"
 MAX_TRAIN_ROWS="${MAX_TRAIN_ROWS:-0}"
 MAX_VALID_ROWS="${MAX_VALID_ROWS:-0}"
 MAX_STAGE1_BATCHES="${MAX_STAGE1_BATCHES:-0}"
@@ -60,6 +61,11 @@ fi
 STAGE2_RESUME_ARGS=()
 if [[ -n "${STAGE1_CHECKPOINT_PATH}" ]]; then
   STAGE2_RESUME_ARGS+=(--checkpoint-path "${STAGE1_CHECKPOINT_PATH}")
+fi
+
+STAGE3_RESUME_ARGS=()
+if [[ -n "${STAGE2_CHECKPOINT_PATH}" ]]; then
+  STAGE3_RESUME_ARGS+=(--checkpoint-path "${STAGE2_CHECKPOINT_PATH}")
 fi
 
 python training.py \
@@ -111,12 +117,21 @@ python training.py \
   "${PEFT_ARGS[@]}"
 
 if [[ "${RUN_STAGE3}" == "1" ]]; then
-  python scripts/run_stage3_rollout_train.py \
+  python training.py \
+    --mode optimizing \
     --data_root "${DATA_ROOT}" \
-    --split train \
+    --train_stage stage2_loop \
     --modelname "${MODELNAME}" \
-    --scale default \
     --resume_epoch "${STAGE2_EPOCH}" \
-    --max-steps "${STAGE3_MAX_STEPS}" \
-    --print-every 10
+    "${STAGE3_RESUME_ARGS[@]}" \
+    --batch_size "${BATCH_SIZE}" \
+    --result_top_k "${RESULT_TOP_K}" \
+    --rl_max_steps "${STAGE3_MAX_STEPS}" \
+    --rl_logging_steps 10 \
+    --experiment_name stage3-rollout-rl \
+    --dataset_num_proc "${DATASET_NUM_PROC}" \
+    --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
+    --dataloader_pin_memory true \
+    --dataloader_persistent_workers true \
+    "${PEFT_ARGS[@]}"
 fi

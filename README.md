@@ -26,6 +26,7 @@ conda run -n patternabductive python scripts/hydrate_stage2_traces.py ^
   --splits train,valid,test ^
   --result-top-k 3 ^
   --trace-cache-size 100000 ^
+  --rebuild ^
   --overwrite
 ```
 
@@ -72,6 +73,18 @@ stage2_trace
 
 `sampled_data_abduction/` may keep `stage2_trace` empty for quick conversion. `sampled_data_abduction_traced/` stores the same compact rows with precomputed ACTION/RESULT trace, so Stage 2 no longer calls the KG during SFT preprocessing.
 
+Current ACTION schema:
+
+```text
+ACTION FIND_COMMON TARGETS [...] TOP_K k
+ACTION FIND_ALTERNATIVE TARGETS [...] TOP_K k
+ACTION FIND_EXCLUSION TARGETS [...] TOP_K k
+ACTION EXPAND TARGETS [...] DIRECTION backward|forward TOP_K k
+ACTION CHECK_COVERAGE CANDIDATES [...] OBS [...] TOP_K k
+```
+
+Multi-hop supervision is represented by repeated one-hop actions. For example, a two-hop branch is trained as `FIND_* -> EXPAND -> CHECK_COVERAGE -> DSL`, not as a single oracle `MAX_HOPS 2` request.
+
 ## Stage 1
 
 ```bash
@@ -100,16 +113,17 @@ conda run -n patternabductive python training.py ^
 ## Stage 3
 
 ```bash
-conda run -n patternabductive python scripts/run_stage3_rollout_train.py ^
+conda run -n patternabductive python training.py ^
+  --mode optimizing ^
   --data_root ./sampled_data_abduction_traced/ ^
-  --split train ^
+  --train_stage stage2_loop ^
   --modelname GPT2_6_act_nt ^
-  --scale <stage2_scale> ^
   --resume_epoch <stage2_epoch> ^
-  --max-steps 100
+  --rl_max_steps 100 ^
+  --rl_logging_steps 10
 ```
 
-Stage 3 does full rollout RL from `OBS`; it does not use dataset action traces as targets.
+Stage 3 now enters through `training.py --mode optimizing`. For `--train_stage stage2_loop`, it does full rollout RL from `OBS`; it does not use dataset action traces as targets. If the model emits `ACTION`, KG is called and `RESULT` is appended. If it emits `DSL`, the rollout stops and the executable DSL is scored against the input OBS.
 
 Rollout evaluation:
 
@@ -157,7 +171,7 @@ The current minimal speed path is:
 1. Hydrate stage2_trace once.
 2. Let utils/dataloader.py expand trace into prefix-to-next-step samples.
 3. Save the expanded HuggingFace dataset cache under dataset_cache/.
-4. Reuse the processed cache on later runs with the same data_root, train_stage, top_k, and max_rows.
+4. Reuse the processed cache on later runs with the same data_root, train_stage, ACTION schema, top_k, and max_rows.
 5. Use dataset_num_proc for HF map and dataloader_num_workers/pin_memory for batch loading.
 6. Skip KG loading automatically during SFT when logic_dsl/stage2_trace already exist.
 7. Use --accelerate --mixed_precision fp16 or bf16 on cloud GPUs that support it.

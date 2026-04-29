@@ -211,8 +211,9 @@ def write_text_format_manifest(output_dir, args):
         'changes': [
             'Sampling writes compact abduction SFT rows directly.',
             'Raw rows keep only pattern_str, observation_text, logic_dsl, and stage2_trace.',
-            'stage2_trace stores one-hop ACTION/RESULT events; dataloader expands it into prefix-to-next-step SFT samples.',
-            'ACTION no longer exposes oracle depth fields; multi-hop supervision is represented by repeated one-hop ACTION calls.',
+            'stage2_trace stores graph-search ACTION/RESULT events; dataloader expands it into prefix-to-next-step SFT samples.',
+            'ACTION uses repeated one-hop graph search: FIND_COMMON/FIND_ALTERNATIVE/FIND_EXCLUSION, EXPAND, and CHECK_COVERAGE.',
+            'Oracle depth fields are not exposed; deeper evidence is represented by repeated EXPAND calls.',
         ],
         'exclude_condition_types': args.exclude_condition_types,
         'result_top_k': args.result_top_k,

@@ -10,6 +10,7 @@ from utils.textualization import (
 
 EVIDENCE_CONTROL_TOKENS = [
     'RESULT',
+    'MODE',
     'EVIDENCE',
     'CANDIDATE',
     'SUPPORT',
@@ -135,6 +136,121 @@ def build_common_cause_evidence(
     }
 
 
+def build_expand_evidence(
+        target_text: str,
+        kg,
+        graph_split: str = 'train',
+        top_k: int = 10,
+        direction: str = 'backward',
+        max_supports_per_candidate: int = 4):
+    target_ids = observation_text_to_answer_ids(target_text, kg)
+    sampler = _resolve_graph_sampler(kg, graph_split)
+    direction = str(direction or 'backward').lower()
+    support_by_candidate = defaultdict(list)
+
+    for target_index, target_id in enumerate(target_ids):
+        if direction == 'forward':
+            edge_iter = (
+                {
+                    'subject_id': int(source_id),
+                    'relation_id': int(relation_id),
+                    'object_id': int(object_id),
+                    'observation_index': target_index,
+                }
+                for source_id, object_id, relation_id in sampler.out_edges(int(target_id))
+            )
+            candidate_getter = lambda edge: edge['object_id']
+        else:
+            edge_iter = (
+                {
+                    'subject_id': int(source_id),
+                    'relation_id': int(relation_id),
+                    'object_id': int(object_id),
+                    'observation_index': target_index,
+                }
+                for source_id, object_id, relation_id in sampler.in_edges(int(target_id))
+            )
+            candidate_getter = lambda edge: edge['subject_id']
+
+        for edge in edge_iter:
+            support_by_candidate[int(candidate_getter(edge))].append(edge)
+
+    candidates = []
+    target_id_set = set(target_ids)
+    for candidate_id, supports in support_by_candidate.items():
+        if direction == 'forward':
+            covered_ids = {support['subject_id'] for support in supports}
+        else:
+            covered_ids = {support['object_id'] for support in supports}
+        missing_ids = [target_id for target_id in target_ids if target_id not in covered_ids]
+        coverage_num = len(covered_ids & target_id_set)
+        coverage_den = max(len(target_ids), 1)
+        candidates.append({
+            'entity_id': candidate_id,
+            'support': supports[:max_supports_per_candidate],
+            'missing_ids': missing_ids,
+            'coverage_num': coverage_num,
+            'coverage_den': coverage_den,
+            'depths': [1],
+            'score': coverage_num / coverage_den,
+        })
+
+    candidates.sort(key=lambda item: (-item['coverage_num'], len(item['missing_ids']), item['entity_id']))
+    return {
+        'mode': 'expand',
+        'direction': direction,
+        'graph_split': graph_split,
+        'observation_ids': target_ids,
+        'candidates': candidates[:top_k],
+    }
+
+
+def build_candidate_coverage_evidence(
+        candidate_text: str,
+        observation_text: str,
+        kg,
+        graph_split: str = 'train',
+        top_k: int = 10,
+        max_supports_per_candidate: int = 8):
+    candidate_ids = observation_text_to_answer_ids(candidate_text, kg)
+    observation_ids = observation_text_to_answer_ids(observation_text, kg)
+    observation_id_set = set(observation_ids)
+    sampler = _resolve_graph_sampler(kg, graph_split)
+    candidates = []
+
+    for candidate_id in candidate_ids:
+        supports = []
+        for source_id, object_id, relation_id in sampler.out_edges(int(candidate_id)):
+            if int(object_id) not in observation_id_set:
+                continue
+            supports.append({
+                'subject_id': int(source_id),
+                'relation_id': int(relation_id),
+                'object_id': int(object_id),
+            })
+
+        covered_ids = {support['object_id'] for support in supports}
+        missing_ids = [obs_id for obs_id in observation_ids if obs_id not in covered_ids]
+        coverage_num = len(covered_ids & observation_id_set)
+        coverage_den = max(len(observation_ids), 1)
+        candidates.append({
+            'entity_id': int(candidate_id),
+            'support': supports[:max_supports_per_candidate],
+            'missing_ids': missing_ids,
+            'coverage_num': coverage_num,
+            'coverage_den': coverage_den,
+            'score': coverage_num / coverage_den,
+        })
+
+    candidates.sort(key=lambda item: (-item['coverage_num'], len(item['missing_ids']), item['entity_id']))
+    return {
+        'mode': 'check_coverage',
+        'graph_split': graph_split,
+        'observation_ids': observation_ids,
+        'candidates': candidates[:top_k],
+    }
+
+
 def build_path_evidence(
         observation_text: str,
         kg,
@@ -208,6 +324,10 @@ def build_path_evidence(
 
 def render_evidence_package(evidence: dict, kg, prefix: str = 'RESULT') -> str:
     lines = [prefix]
+    if evidence.get('mode'):
+        lines.append(f'MODE {evidence["mode"]}')
+    if evidence.get('direction'):
+        lines.append(f'DIRECTION {evidence["direction"]}')
     candidates = evidence.get('candidates', [])
     observation_ids = evidence.get('observation_ids', [])
 

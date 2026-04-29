@@ -5,15 +5,27 @@ from utils.textualization import tokenize_surface_text
 ACTION_CONTROL_TOKENS = [
     'ACTION',
     'TARGETS',
+    'CANDIDATES',
+    'OBS',
+    'DIRECTION',
     'TOP_K',
-    'FIND_COMMON_CAUSE',
-    'FIND_ALTERNATIVE_CAUSES',
-    'FIND_NEGATIVE_EVIDENCE',
+    'FIND_COMMON',
+    'FIND_ALTERNATIVE',
+    'FIND_EXCLUSION',
+    'EXPAND',
+    'CHECK_COVERAGE',
 ]
 VALID_ACTION_TYPES = {
-    'FIND_COMMON_CAUSE',
-    'FIND_ALTERNATIVE_CAUSES',
-    'FIND_NEGATIVE_EVIDENCE',
+    'FIND_COMMON',
+    'FIND_ALTERNATIVE',
+    'FIND_EXCLUSION',
+    'EXPAND',
+    'CHECK_COVERAGE',
+}
+ACTION_ALIASES = {
+    'FIND_COMMON_CAUSE': 'FIND_COMMON',
+    'FIND_ALTERNATIVE_CAUSES': 'FIND_ALTERNATIVE',
+    'FIND_NEGATIVE_EVIDENCE': 'FIND_EXCLUSION',
 }
 
 
@@ -71,10 +83,10 @@ def infer_action_type(pattern_str: str) -> str:
     operators = [operator for operator, _ in _walk_pattern(pattern_nested)]
 
     if 'n' in operators:
-        return 'FIND_NEGATIVE_EVIDENCE'
+        return 'FIND_EXCLUSION'
     if 'u' in operators:
-        return 'FIND_ALTERNATIVE_CAUSES'
-    return 'FIND_COMMON_CAUSE'
+        return 'FIND_ALTERNATIVE'
+    return 'FIND_COMMON'
 
 
 def infer_max_hops(pattern_str: str, minimum: int = 1, maximum: int = 4) -> int:
@@ -86,9 +98,33 @@ def infer_action_steps(pattern_str: str, minimum: int = 1, maximum: int = 4) -> 
     return infer_max_hops(pattern_str=pattern_str, minimum=minimum, maximum=maximum)
 
 
-def render_action_text(action_type: str, targets: list[str], top_k: int = 10) -> str:
-    target_text = ' '.join(targets)
-    return f'ACTION {action_type} TARGETS {target_text} TOP_K {int(top_k)}'.strip()
+def normalize_action_type(action_type: str) -> str:
+    normalized = ACTION_ALIASES.get(str(action_type).strip(), str(action_type).strip())
+    return normalized
+
+
+def render_action_text(
+        action_type: str,
+        targets: list[str] | None = None,
+        top_k: int = 10,
+        candidates: list[str] | None = None,
+        obs: list[str] | None = None,
+        direction: str | None = None) -> str:
+    action_type = normalize_action_type(action_type)
+    parts = ['ACTION', action_type]
+
+    if action_type == 'CHECK_COVERAGE':
+        candidate_text = ' '.join(candidates or targets or [])
+        obs_text = ' '.join(obs or [])
+        parts.extend(['CANDIDATES', candidate_text, 'OBS', obs_text])
+    else:
+        target_text = ' '.join(targets or [])
+        parts.extend(['TARGETS', target_text])
+        if action_type == 'EXPAND':
+            parts.extend(['DIRECTION', str(direction or 'backward')])
+
+    parts.extend(['TOP_K', str(int(top_k))])
+    return ' '.join(part for part in parts if str(part).strip()).strip()
 
 
 def build_action_text(

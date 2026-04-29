@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
@@ -41,11 +42,13 @@ from utils.dataloader import (
     filter_dataset_by_excluded_condition_types,
     new_create_dataloader,
     new_create_dataset,
+    record_has_current_stage2_trace,
 )
 from utils.load import load_kg, load_model, load_yaml, resolve_sampled_dataset_path
 from utils.stat_util import stat_scores_by_pattern
-from utils.rl_rewards import score_stage2_completion_batch
+from utils.rl_rewards import score_rollout_trajectory, score_stage2_completion_batch
 from utils.text_scoring import score_text_query_batch
+from utils.tool_loop import extract_action_text, extract_dsl_text, run_action_tool_call
 
 
 PIPELINE_TAG = 'text2text'
@@ -277,19 +280,6 @@ def collect_dataset_sizes(dataset_dict):
     }
 
 
-def _record_has_nonempty_stage2_trace(record):
-    trace = record.get('stage2_trace')
-    if isinstance(trace, str):
-        stripped = trace.strip()
-        if not stripped:
-            return False
-        try:
-            trace = json.loads(stripped)
-        except Exception:
-            return False
-    return bool(trace)
-
-
 def _read_first_jsonl_record(path):
     with open(path, 'r', encoding='utf-8') as input_file:
         for line in input_file:
@@ -314,7 +304,7 @@ def training_data_needs_kg(args, splits):
 
         if 'logic_dsl' not in first_record:
             return True
-        if args.train_stage == 'stage2_loop' and not _record_has_nonempty_stage2_trace(first_record):
+        if args.train_stage == 'stage2_loop' and not record_has_current_stage2_trace(first_record):
             return True
 
     return False
@@ -512,7 +502,7 @@ def write_rl_experiment_summary(experiment_record, trainer_result):
         f'- splits_used: {", ".join(experiment_record["metadata"]["data"]["splits_used"])}',
         f'- pipeline: {experiment_record["metadata"]["data"]["pipeline"]}',
         '',
-        '## GRPO Metrics',
+        '## RL Metrics',
     ]
 
     if metrics:
@@ -680,6 +670,268 @@ def build_grpo_dataset(dataset):
     if removable:
         dataset = dataset.remove_columns(removable)
     return dataset
+
+
+def _extract_dsl_target_text(target: str) -> str:
+    text = str(target or '').strip()
+    if ' DSL ' in text:
+        return text.split(' DSL ', 1)[1].strip()
+    if text.startswith('DSL '):
+        return text[len('DSL '):].strip()
+    return text
+
+
+def _rollout_records_from_dataset(dataset):
+    records = []
+    for row in dataset:
+        observation = str(row.get('observation_text') or row.get('source') or '').strip()
+        if observation and not observation.startswith('OBS '):
+            observation = 'OBS ' + observation
+        target = _extract_dsl_target_text(row.get('logic_dsl') or row.get('target') or '')
+        if observation:
+            records.append({
+                'observation_text': observation,
+                'logic_dsl': target,
+            })
+    return records
+
+
+def _build_rollout_prompt(observation_text, history):
+    return '\n'.join([str(observation_text).strip(), *history]).strip()
+
+
+@torch.no_grad()
+def _sample_rollout_completion(model, tokenizer, prompt, device, args):
+    tokenized = tokenizer(prompt, return_tensors='pt').to(device)
+    input_len = tokenized.input_ids.shape[-1]
+    generation_kwargs = {
+        'input_ids': tokenized.input_ids,
+        'attention_mask': tokenized.attention_mask,
+        'max_new_tokens': args.rl_max_completion_length,
+        'pad_token_id': tokenizer.pad_token_id,
+        'bos_token_id': tokenizer.bos_token_id,
+        'eos_token_id': tokenizer.eos_token_id,
+        'do_sample': True,
+        'temperature': args.rl_temperature,
+    }
+    if args.rl_top_k > 0:
+        generation_kwargs['top_k'] = args.rl_top_k
+    if args.rl_top_p < 1.0:
+        generation_kwargs['top_p'] = args.rl_top_p
+    output = model.generate(**generation_kwargs)
+    generated_ids = output[0, input_len:].detach().cpu().tolist()
+    completion = decode_text_token_ids(tokenizer, generated_ids, preserve_whitespace=True)
+    return {
+        'prompt': prompt,
+        'generated_ids': generated_ids,
+        'completion': completion,
+    }
+
+
+def rollout_once(model, tokenizer, kg, record, device, args):
+    observation = str(record['observation_text']).strip()
+    if not observation.startswith('OBS '):
+        observation = 'OBS ' + observation
+
+    history = []
+    segments = []
+    raw_generations = []
+
+    for step in range(1, args.rl_max_action_steps + 1):
+        prompt = _build_rollout_prompt(observation, history)
+        segment = _sample_rollout_completion(model, tokenizer, prompt, device, args)
+        segments.append(segment)
+        generated = segment['completion']
+        raw_generations.append({'step': step, 'prompt': prompt, 'generated': generated})
+
+        dsl_text = extract_dsl_text(generated)
+        if dsl_text is not None:
+            return {
+                'observation': observation,
+                'history': history,
+                'dsl': dsl_text,
+                'raw_generations': raw_generations,
+                'segments': segments,
+                'stopped_by': 'dsl',
+            }
+
+        action_text = extract_action_text(generated)
+        if action_text is None:
+            return {
+                'observation': observation,
+                'history': history,
+                'dsl': '',
+                'raw_generations': raw_generations,
+                'segments': segments,
+                'stopped_by': 'unparseable_generation',
+            }
+
+        try:
+            tool_output = run_action_tool_call(
+                observation_text=observation,
+                action_text=action_text,
+                kg=kg,
+                graph_split=args.rl_search_split,
+            )
+        except Exception as exc:
+            history.append(action_text)
+            return {
+                'observation': observation,
+                'history': history,
+                'dsl': '',
+                'raw_generations': [*raw_generations, {'step': step, 'tool_error': str(exc)}],
+                'segments': segments,
+                'stopped_by': 'action_execution_error',
+            }
+        history.extend([action_text, tool_output['result_text']])
+
+    prompt = _build_rollout_prompt(observation, history)
+    segment = _sample_rollout_completion(model, tokenizer, prompt, device, args)
+    segments.append(segment)
+    generated = segment['completion']
+    raw_generations.append({'step': 'final', 'prompt': prompt, 'generated': generated})
+    return {
+        'observation': observation,
+        'history': history,
+        'dsl': extract_dsl_text(generated) or generated.strip(),
+        'raw_generations': raw_generations,
+        'segments': segments,
+        'stopped_by': 'max_action_steps',
+    }
+
+
+def _segment_ce_loss(model, tokenizer, segment, device):
+    generated_ids = [
+        token_id
+        for token_id in segment['generated_ids']
+        if token_id != tokenizer.pad_token_id
+    ]
+    if not generated_ids:
+        return None
+
+    prompt_ids = tokenizer(segment['prompt'], return_tensors='pt').input_ids.to(device)
+    generated = torch.tensor([generated_ids], dtype=torch.long, device=device)
+    input_ids = torch.cat([prompt_ids, generated], dim=1)
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    labels[:, :prompt_ids.shape[-1]] = -100
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    return outputs.loss
+
+
+def _rollout_policy_loss(model, tokenizer, rollout, advantage, device):
+    losses = []
+    for segment in rollout.get('segments', []):
+        loss = _segment_ce_loss(model, tokenizer, segment, device)
+        if loss is not None:
+            losses.append(loss)
+    if not losses:
+        return None
+    ce_loss = torch.stack(losses).mean()
+    return ce_loss * float(advantage)
+
+
+def optimize_rollout_policy(args, dataset, model, tokenizer, graph_samplers, kg, experiment_record=None):
+    if kg is None or graph_samplers is None:
+        raise RuntimeError('Rollout RL requires KG to execute ACTION calls.')
+
+    records = _rollout_records_from_dataset(dataset)
+    if not records:
+        raise RuntimeError('No rollout records available for RL.')
+
+    max_steps = args.rl_max_steps if args.rl_max_steps > 0 else max(1, int(args.rl_epochs) * len(records))
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_params:
+        raise RuntimeError('No trainable parameters found for rollout RL.')
+    optimizer = torch.optim.AdamW(trainable_params, lr=float(args.rl_lr))
+    device = next(model.parameters()).device
+    output_dir = (
+        experiment_record['paths']['experiment_dir']
+        if experiment_record is not None
+        else os.path.join(args.optim_experiment_root, build_experiment_name(args))
+    )
+    pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+    log_path = (
+        experiment_record['paths']['run_log_path']
+        if experiment_record is not None
+        else os.path.join(output_dir, 'rollout_rl.jsonl')
+    )
+
+    baseline = 0.0
+    metrics = {
+        'max_steps': max_steps,
+        'records': len(records),
+        'last_reward': 0.0,
+        'last_loss': 0.0,
+        'last_jaccard': 0.0,
+        'last_num_actions': 0,
+    }
+
+    model.train()
+    for step in range(1, max_steps + 1):
+        record = random.choice(records)
+        model.eval()
+        rollout = rollout_once(model, tokenizer, kg, record, device, args)
+        score = score_rollout_trajectory(
+            rollout=rollout,
+            target=record.get('logic_dsl', ''),
+            observation_text=record['observation_text'],
+            kg=kg,
+            graph_samplers=graph_samplers,
+            graph_split=args.rl_search_split,
+        )
+        reward = float(score['stage3_reward'])
+        advantage = max(min(reward - baseline, args.rl_advantage_clip), -args.rl_advantage_clip)
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        loss = _rollout_policy_loss(model, tokenizer, rollout, advantage, device)
+        loss_value = 0.0
+        if loss is not None:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.rl_grad_clip)
+            optimizer.step()
+            loss_value = float(loss.detach().cpu())
+
+        baseline = args.rl_baseline_momentum * baseline + (1.0 - args.rl_baseline_momentum) * reward
+        row = {
+            'step': step,
+            'reward': reward,
+            'baseline': baseline,
+            'advantage': advantage,
+            'loss': loss_value,
+            'stopped_by': rollout.get('stopped_by', ''),
+            'num_actions': score.get('num_actions', 0),
+            'action_parse_rate': score.get('action_parse_rate', 0.0),
+            'action_execution_rate': score.get('action_execution_rate', 0.0),
+            'jaccard': score.get('jaccard', 0.0),
+            'answer_recall': score.get('answer_recall', 0.0),
+            'answer_precision': score.get('answer_precision', 0.0),
+            'observation_text': record['observation_text'],
+            'pred_dsl': rollout.get('dsl', ''),
+        }
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            log_file.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+        metrics.update({
+            'last_reward': reward,
+            'last_loss': loss_value,
+            'last_jaccard': row['jaccard'],
+            'last_num_actions': row['num_actions'],
+            'baseline': baseline,
+        })
+
+        if args.rl_logging_steps > 0 and (step == 1 or step % args.rl_logging_steps == 0):
+            print(json.dumps(row, ensure_ascii=False))
+
+        if args.rl_save_steps > 0 and step % args.rl_save_steps == 0:
+            ckpt_path = get_checkpoint_path(args, step, optimized=True)
+            save_model(ckpt_path, 'rlmodel', model, optimizer=optimizer, epoch=step, loss_log={'rollout_step': step})
+
+    final_path = get_checkpoint_path(args, args.rl_epochs, optimized=True)
+    save_model(final_path, 'rlmodel', model, optimizer=optimizer, epoch=args.rl_epochs, loss_log={'rollout_step': max_steps})
+    metrics['final_checkpoint'] = final_path
+    return SimpleNamespace(metrics=metrics)
 
 
 def optimize_grpo(args, dataset, model, tokenizer, graph_samplers, kg, batch_size, experiment_record=None):
@@ -1030,16 +1282,11 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
             optimizer, scheduler = create_optimizer_and_scheduler(model, config_train)
 
     if args.mode == 'optimizing' and args.rl_resume_epoch == 0 and args.rl_use_peft:
-        from peft import LoraConfig, get_peft_model
-
-        lora_config = LoraConfig(
-            r=4,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            bias='none',
-            task_type='CAUSAL_LM',
-        )
-        model = get_peft_model(model, peft_config=lora_config)
+        original_use_peft = args.use_peft
+        args.use_peft = True
+        model, _ = apply_lora_if_requested(model, args)
+        args.use_peft = original_use_peft
+        model.to(device)
 
     print('model.config:')
     print(model.config)
@@ -1485,6 +1732,13 @@ def my_parse_args():
     parser.add_argument('--rl_num_generations', type=int, default=4)
     parser.add_argument('--rl_max_prompt_length', type=int, default=128)
     parser.add_argument('--rl_max_completion_length', type=int, default=128)
+    parser.add_argument('--rl_max_action_steps', type=int, default=3)
+    parser.add_argument('--rl_temperature', type=float, default=0.8)
+    parser.add_argument('--rl_top_k', type=int, default=50)
+    parser.add_argument('--rl_top_p', type=float, default=1.0)
+    parser.add_argument('--rl_baseline_momentum', type=float, default=0.9)
+    parser.add_argument('--rl_advantage_clip', type=float, default=2.0)
+    parser.add_argument('--rl_grad_clip', type=float, default=1.0)
     parser.add_argument('--rl_logging_steps', type=int, default=10)
     parser.add_argument('--rl_save_steps', type=int, default=100)
     parser.add_argument('--rl_log_completions', action='store_true')
@@ -1560,11 +1814,6 @@ def main():
         splits = [args.test_split]
     else:
         splits = ['train']
-        try:
-            resolve_sampled_dataset_path(args.data_root, args.dataname, 'valid')
-            splits.append('valid')
-        except FileNotFoundError:
-            pass
         if args.rl_search_split not in splits:
             splits.append(args.rl_search_split)
 
@@ -1576,6 +1825,12 @@ def main():
         print('# Skipping KG load: training data already has logic_dsl/stage2_trace.')
         kg = None
         graph_samplers = None
+
+    dataset_train_stage = args.train_stage
+    if args.mode == 'optimizing' and args.train_stage == 'stage2_loop':
+        # Rollout RL starts from raw OBS and lets the model decide ACTION/DSL.
+        # Do not expand Stage 2 SFT prefixes for the RL dataset.
+        dataset_train_stage = 'logic'
 
     print('Creating dataset & dataloader')
     dataset_dict, _, _ = new_create_dataset(
@@ -1595,7 +1850,7 @@ def main():
         dataset_cache_root=args.dataset_cache_root,
         dataset_num_proc=args.dataset_num_proc,
         dataset_map_batch_size=args.dataset_map_batch_size,
-        train_stage=args.train_stage,
+        train_stage=dataset_train_stage,
         result_top_k=args.result_top_k,
     )
 
@@ -1744,18 +1999,29 @@ def main():
             device=device,
             accelerator=None,
             log_path=experiment_record['paths']['comparison_log_path'],
-            stage_label='before_grpo',
+            stage_label='before_rl',
         )
-        trainer_result = optimize_grpo(
-            args=args,
-            dataset=dataset_dict['train'],
-            model=model,
-            tokenizer=tokenizer,
-            graph_samplers=graph_samplers,
-            kg=kg,
-            batch_size=args.batch_size,
-            experiment_record=experiment_record,
-        )
+        if args.train_stage == 'stage2_loop':
+            trainer_result = optimize_rollout_policy(
+                args=args,
+                dataset=dataset_dict['train'],
+                model=model,
+                tokenizer=tokenizer,
+                graph_samplers=graph_samplers,
+                kg=kg,
+                experiment_record=experiment_record,
+            )
+        else:
+            trainer_result = optimize_grpo(
+                args=args,
+                dataset=dataset_dict['train'],
+                model=model,
+                tokenizer=tokenizer,
+                graph_samplers=graph_samplers,
+                kg=kg,
+                batch_size=args.batch_size,
+                experiment_record=experiment_record,
+            )
         log_prediction_comparisons(
             args=args,
             dataset_dict=dataset_dict,
@@ -1766,7 +2032,7 @@ def main():
             device=device,
             accelerator=None,
             log_path=experiment_record['paths']['comparison_log_path'],
-            stage_label='after_grpo',
+            stage_label='after_rl',
         )
         write_rl_experiment_summary(experiment_record, trainer_result)
 

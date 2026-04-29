@@ -7,7 +7,11 @@ def is_complete_action_text(action_text: str) -> bool:
         action = parse_action_text(action_text)
     except Exception:
         return False
-    return bool(action.get('action_type')) and bool(action.get('targets'))
+    if not action.get('action_type'):
+        return False
+    if action.get('action_type') == 'CHECK_COVERAGE':
+        return bool(action.get('candidates')) and bool(action.get('obs'))
+    return bool(action.get('targets'))
 
 
 def extract_action_text(generated_text: str) -> str | None:

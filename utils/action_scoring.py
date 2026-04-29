@@ -88,8 +88,9 @@ def score_action_text(
         return result
 
     result['action_parse_success'] = 1.0
+    action_targets = action.get('targets') or action.get('candidates') or action.get('obs') or []
     grounding = compute_target_grounding(
-        action_targets=action.get('targets') or [],
+        action_targets=action_targets,
         frontier_targets=extract_frontier_entity_tokens(observation_text),
     )
     result.update(grounding)

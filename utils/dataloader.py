@@ -14,6 +14,14 @@ from utils.text_dataset import build_stage2_trace
 
 REPRESENTATION_TEXT = 'text'
 DEFAULT_TRAIN_STAGE = 'logic'
+ACTION_SCHEMA_VERSION = 'actionv2'
+CURRENT_ACTION_PREFIXES = (
+    'ACTION FIND_COMMON ',
+    'ACTION FIND_ALTERNATIVE ',
+    'ACTION FIND_EXCLUSION ',
+    'ACTION EXPAND ',
+    'ACTION CHECK_COVERAGE ',
+)
 
 
 def new_create_dataloader(
@@ -120,26 +128,55 @@ def _normalize_nested_records(value):
     return []
 
 
+def trace_uses_current_action_schema(trace) -> bool:
+    normalized = _normalize_nested_records(trace)
+    if not normalized:
+        return False
+    action_count = 0
+    for event in normalized:
+        action = str(event.get('action', '')).strip()
+        if not action:
+            continue
+        action_count += 1
+        if not any(action.startswith(prefix) for prefix in CURRENT_ACTION_PREFIXES):
+            return False
+    return action_count > 0
+
+
+def record_has_current_stage2_trace(record) -> bool:
+    return trace_uses_current_action_schema(record.get('stage2_trace'))
+
+
 def _derive_stage2_traces_for_batch(batch, kg, graph_split, top_k):
     trace_values = _get_column_or_default(batch, 'stage2_trace', []) if 'stage2_trace' in batch else []
-    if trace_values and any(trace_values):
-        return [_normalize_nested_records(trace) for trace in trace_values]
+    traces = []
+    missing_indices = []
+    for index, trace in enumerate(trace_values):
+        normalized = _normalize_nested_records(trace)
+        if normalized and trace_uses_current_action_schema(normalized):
+            traces.append(normalized)
+        else:
+            traces.append(None)
+            missing_indices.append(index)
 
-    if kg is None:
+    if missing_indices and kg is None:
         raise ValueError(
-            'Stage 2 requires precomputed stage2_trace or a loaded KG. '
-            'Use scripts/hydrate_stage2_traces.py to prefill trace before fast SFT.'
+            'Stage 2 requires current-schema stage2_trace or a loaded KG. '
+            'Run scripts/hydrate_stage2_traces.py with --rebuild to prefill trace before fast SFT.'
         )
 
-    traces = []
-    for pattern_str, observation_text in zip(batch['pattern_str'], batch['observation_text']):
-        traces.append(build_stage2_trace(
-            pattern_str=pattern_str,
-            observation_text=observation_text,
+    if not trace_values:
+        traces = [None] * len(batch['pattern_str'])
+        missing_indices = list(range(len(traces)))
+
+    for index in missing_indices:
+        traces[index] = build_stage2_trace(
+            pattern_str=batch['pattern_str'][index],
+            observation_text=batch['observation_text'][index],
             kg=kg,
             graph_split=graph_split,
             top_k=top_k,
-        ))
+        )
     return traces
 
 
@@ -253,16 +290,17 @@ def _select_dataset_rows(dataset, max_rows):
 
 def _cache_fields_for_stage(source_text_field, target_text_field, train_stage, result_top_k, max_rows):
     row_tag = 'full' if max_rows is None or max_rows <= 0 else f'first{int(max_rows)}'
-    stage_tag = f'{train_stage}|topk{int(result_top_k)}|rows-{row_tag}'
+    schema_tag = ACTION_SCHEMA_VERSION if train_stage == 'stage2_loop' else 'logicv1'
+    stage_tag = f'{train_stage}|{schema_tag}|topk{int(result_top_k)}|rows-{row_tag}'
     return f'{source_text_field}|{stage_tag}', f'{target_text_field}|{stage_tag}'
 
 
-def _dataset_has_nonempty_trace(dataset, sample_size: int = 1024):
+def _dataset_has_current_trace(dataset, sample_size: int = 1024):
     if 'stage2_trace' not in dataset.column_names:
         return False
     sample_count = min(len(dataset), max(1, int(sample_size)))
     for index in range(sample_count):
-        if _normalize_nested_records(dataset[index].get('stage2_trace')):
+        if record_has_current_stage2_trace(dataset[index]):
             return True
     return False
 
@@ -272,7 +310,7 @@ def _stage_preprocess_needs_kg(raw_dataset, train_stage):
     if train_stage == 'logic':
         return needs_logic_dsl
     if train_stage == 'stage2_loop':
-        return needs_logic_dsl or not _dataset_has_nonempty_trace(raw_dataset)
+        return needs_logic_dsl or not _dataset_has_current_trace(raw_dataset)
     return False
 
 

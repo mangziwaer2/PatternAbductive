@@ -161,6 +161,7 @@ def write_manifest(args, split_stats):
         'split_stats': split_stats,
         'notes': [
             'stage2_trace is precomputed to avoid KG calls during Stage 2 SFT preprocessing.',
+            'stage2_trace uses graph-search ACTION/RESULT events: FIND_COMMON/FIND_ALTERNATIVE/FIND_EXCLUSION, EXPAND, CHECK_COVERAGE.',
             'SFT still expands trace into prefix-to-next-step samples inside utils/dataloader.py.',
             'RL rollout training does not use stage2_trace as target.',
         ],
