@@ -17,16 +17,15 @@ OBS [entity_a] [entity_b]
 ACTION FIND_COMMON TARGETS [entity_a] [entity_b] TOP_K 3
 </ACTION>
 <RESULT>
-RESULT
 [candidate] --[+relation]--> [entity_a]
 [candidate] --[+relation]--> [entity_b]
 </RESULT>
 <DSL>
-DSL AND(PROJ([+relation], ENT([entity_a])), PROJ([+relation], ENT([entity_b])))
+AND(PROJ([+relation], ENT([entity_a])), PROJ([+relation], ENT([entity_b])))
 </DSL>
 ```
 
-`RESULT` is deliberately compact: only the marker line and subgraph edge lines are kept. It does not include coverage, candidate summaries, or mode fields.
+`RESULT` is deliberately compact: only subgraph edge lines are kept inside the result tags. It does not include coverage, candidate summaries, mode fields, or an extra `RESULT` line.
 
 ## Sampling
 
@@ -120,6 +119,37 @@ python training.py \
   --rl_max_action_steps 3 \
   --rl_max_completion_length 128
 ```
+
+## Testing
+
+Use `testing.py` for a quick local checkpoint check.
+
+Stage 1:
+
+```bash
+python testing.py \
+  --stage logic \
+  --modelname Qwen2.5-0.5B \
+  --checkpoint-path /path/to/checkpoint-or-kaggle-input-dir \
+  --obs "[entity_a] [entity_b]" \
+  --disable_text_extra_tokens \
+  --use_peft
+```
+
+Stage 2:
+
+```bash
+python testing.py \
+  --stage stage2 \
+  --modelname Qwen2.5-0.5B \
+  --checkpoint-path /path/to/checkpoint-or-kaggle-input-dir \
+  --obs "[entity_a] [entity_b]" \
+  --max_action_steps 3 \
+  --disable_text_extra_tokens \
+  --use_peft
+```
+
+If the model emits a complete `<ACTION>...</ACTION>` block, the script executes the KG action, prints compact `<RESULT>...</RESULT>`, and continues until a compact `<DSL>...</DSL>` block is produced or the step limit is reached.
 
 ## Notes
 

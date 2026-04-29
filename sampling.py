@@ -206,7 +206,7 @@ def write_stats(output_dir, kg):
 def write_text_format_manifest(output_dir, args):
     manifest_path = os.path.join(output_dir, 'text_format_manifest.json')
     manifest = {
-        'format_version': 'abduction_sft_v1',
+        'format_version': 'abduction_sft_v2_compact_tags',
         'dataname': args.dataname,
         'data_root': args.data_root,
         'generated_by': 'sampling.py',
@@ -215,8 +215,8 @@ def write_text_format_manifest(output_dir, args):
             'Raw rows keep only pattern_str, observation_text, logic_dsl, and stage2_trace.',
             'stage2_trace stores graph-search ACTION/RESULT events; dataloader expands it into prefix-to-next-step SFT samples.',
             'ACTION calls are wrapped in <ACTION>...</ACTION> to provide an explicit tool-call boundary.',
-            'RESULT blocks are wrapped in <RESULT>...</RESULT> and contain only compact subgraph edge lines.',
-            'DSL targets are wrapped by the dataloader as <DSL>...</DSL> during training.',
+            'RESULT blocks are wrapped in <RESULT>...</RESULT> and contain only compact subgraph edge lines; no inner RESULT marker is emitted.',
+            'DSL targets are wrapped by the dataloader as <DSL>...</DSL> during training; no inner DSL marker is emitted.',
             'ACTION uses repeated one-hop graph search: FIND_COMMON/FIND_ALTERNATIVE/FIND_EXCLUSION followed by optional EXPAND.',
             'Oracle depth fields are not exposed; deeper evidence is represented by repeated EXPAND calls.',
         ],

@@ -183,11 +183,47 @@ def load_model(path,contents,return_huggingface_model=True,epoch=0,
                 scheduler = checkpoint.get('scheduler')
     elif contents == 'rlmodel':
         _ensure_rlmodel_unpickle_compat()
-        checkpoint = torch.load(path,weights_only=False)
-        model = checkpoint['model']
-        model.warnings_issued = {}
-        optimizer = checkpoint.get('optimizer')
-        scheduler = checkpoint.get('scheduler')
+        if os.path.isdir(path):
+            adapter_config_path = os.path.join(path, 'adapter_config.json')
+            if os.path.exists(adapter_config_path):
+                model = _load_peft_adapter_dir(path, model)
+                optimizer = None
+                scheduler = None
+                checkpoint = {
+                    'epoch': epoch,
+                    'loss_log': {'train': {}, 'valid': {}},
+                }
+            else:
+                checkpoint_file = _find_checkpoint_file_in_dir(path)
+                if not checkpoint_file:
+                    raise IsADirectoryError(
+                        f'Checkpoint path is a directory but contains neither adapter_config.json nor a single .pth file: {path}'
+                    )
+                print(f'# Resolved checkpoint directory to file: {checkpoint_file}')
+                return load_model(
+                    checkpoint_file,
+                    contents,
+                    return_huggingface_model=return_huggingface_model,
+                    epoch=epoch,
+                    model=model,
+                )
+        else:
+            checkpoint = torch.load(path,weights_only=False)
+            if checkpoint.get('peft_checkpoint'):
+                adapter_dir = checkpoint.get('peft_adapter_dir')
+                if adapter_dir is None:
+                    raise ValueError(f'Missing peft_adapter_dir in checkpoint: {path}')
+                adapter_dir = _resolve_peft_adapter_dir(path, adapter_dir)
+                model = _load_peft_adapter_dir(adapter_dir, model)
+                optimizer = None
+                scheduler = None
+            else:
+                if model is not None:
+                    raise ValueError('A base model was passed, but the checkpoint is not a PEFT checkpoint.')
+                model = checkpoint['model']
+                model.warnings_issued = {}
+                optimizer = checkpoint.get('optimizer')
+                scheduler = checkpoint.get('scheduler')
     else:
         print(f'# Error: contents "{contents}" not supported')
         exit()

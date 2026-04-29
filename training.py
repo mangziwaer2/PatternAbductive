@@ -651,6 +651,9 @@ def log_prediction_comparisons(
 
 def _extract_dsl_target_text(target: str) -> str:
     text = str(target or '').strip()
+    tagged_dsl = extract_dsl_text(text)
+    if tagged_dsl is not None:
+        return tagged_dsl
     if ' DSL ' in text:
         return text.split(' DSL ', 1)[1].strip()
     if text.startswith('DSL '):

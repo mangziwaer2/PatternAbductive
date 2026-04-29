@@ -202,7 +202,7 @@ def strip_dsl_tags(text: str) -> str:
 
 def tag_dsl_text(dsl_text: str) -> str:
     body = _strip_dsl_prefix(strip_dsl_tags(dsl_text))
-    return '\n'.join([DSL_START_TAG, f'DSL {body}'.strip(), DSL_END_TAG])
+    return '\n'.join([DSL_START_TAG, body, DSL_END_TAG])
 
 
 def dsl_has_explicit_boundary(text: str) -> bool:

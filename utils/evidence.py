@@ -11,11 +11,19 @@ from utils.textualization import (
 EVIDENCE_CONTROL_TOKENS = [
     '<RESULT>',
     '</RESULT>',
+    # Kept for backward-compatible tokenizer sizes with older checkpoints.
     'RESULT',
     'EVIDENCE',
 ]
 RESULT_START_TAG = '<RESULT>'
 RESULT_END_TAG = '</RESULT>'
+
+
+def _drop_result_prefix(text: str) -> str:
+    lines = str(text or '').strip().splitlines()
+    while lines and lines[0].strip() == 'RESULT':
+        lines = lines[1:]
+    return '\n'.join(lines).strip()
 
 
 def strip_result_tags(result_text: str) -> str:
@@ -26,11 +34,11 @@ def strip_result_tags(result_text: str) -> str:
         end_index = text.find(RESULT_END_TAG)
         if end_index >= 0:
             text = text[:end_index]
-        return text.strip()
+        return _drop_result_prefix(text)
     end_index = text.find(RESULT_END_TAG)
     if end_index >= 0:
         text = text[:end_index]
-    return text.strip()
+    return _drop_result_prefix(text)
 
 
 def tag_result_text(result_text: str) -> str:
@@ -204,11 +212,12 @@ def build_expand_evidence(
 
 
 def render_evidence_package(evidence: dict, kg, prefix: str = 'RESULT') -> str:
-    lines = [prefix]
+    del prefix
+    lines = []
     candidates = evidence.get('candidates', [])
 
     if not candidates:
-        return '\n'.join(lines)
+        return tag_result_text('')
 
     edges = []
     for candidate in candidates:

@@ -16,7 +16,7 @@ from utils.action_supervision import ACTION_END_TAG, ACTION_START_TAG, strip_act
 
 REPRESENTATION_TEXT = 'text'
 DEFAULT_TRAIN_STAGE = 'logic'
-ACTION_SCHEMA_VERSION = 'actionv5_tagged_io'
+ACTION_SCHEMA_VERSION = 'actionv6_compact_tags'
 CURRENT_ACTION_PREFIXES = (
     'ACTION FIND_COMMON ',
     'ACTION FIND_ALTERNATIVE ',
@@ -299,7 +299,7 @@ def _select_dataset_rows(dataset, max_rows):
 
 def _cache_fields_for_stage(source_text_field, target_text_field, train_stage, result_top_k, max_rows):
     row_tag = 'full' if max_rows is None or max_rows <= 0 else f'first{int(max_rows)}'
-    schema_tag = ACTION_SCHEMA_VERSION if train_stage == 'stage2' else 'logicv2'
+    schema_tag = ACTION_SCHEMA_VERSION if train_stage == 'stage2' else 'logicv3'
     stage_tag = f'{train_stage}|{schema_tag}|topk{int(result_top_k)}|rows-{row_tag}'
     return f'{source_text_field}|{stage_tag}', f'{target_text_field}|{stage_tag}'
 
