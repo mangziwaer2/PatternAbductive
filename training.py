@@ -7,6 +7,7 @@ import os
 import pathlib
 import platform
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -1115,9 +1116,43 @@ def get_checkpoint_path(args, epoch, optimized=False):
     return candidates[0]
 
 
+def find_latest_checkpoint_path(args, optimized=False):
+    checkpoint_dir = pathlib.Path(args.checkpoint_root) / args.modelname
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f'Checkpoint directory not found: {checkpoint_dir}')
+
+    prefix = re.escape(f'{args.dataname}-{args.scale}-{args.max_answer_size}-')
+    if optimized:
+        pattern = re.compile(rf'^{prefix}(\d+)-rl-(?:{PIPELINE_TAG}|{LEGACY_PIPELINE_TAG})\.pth$')
+    else:
+        pattern = re.compile(rf'^{prefix}(\d+)-(?:{PIPELINE_TAG}|{LEGACY_PIPELINE_TAG})\.pth$')
+
+    candidates = []
+    for path in checkpoint_dir.glob('*.pth'):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        candidates.append((int(match.group(1)), path.stat().st_mtime, str(path)))
+
+    if not candidates:
+        kind = 'RL' if optimized else 'SFT'
+        raise FileNotFoundError(
+            f'No {kind} checkpoint found in {checkpoint_dir}. '
+            f'Expected names like {args.dataname}-{args.scale}-{args.max_answer_size}-<epoch>'
+            f'{"-rl" if optimized else ""}-{PIPELINE_TAG}.pth'
+        )
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    latest_epoch, _, latest_path = candidates[-1]
+    print(f'# Resolved latest checkpoint epoch={latest_epoch}: {latest_path}')
+    return latest_path
+
+
 def get_resume_checkpoint_path(args, epoch, optimized=False):
     explicit_path = str(getattr(args, 'checkpoint_path', '') or '').strip()
     if explicit_path:
+        if explicit_path.lower() in {'latest', 'last'}:
+            return find_latest_checkpoint_path(args, optimized=optimized)
         return explicit_path
     return get_checkpoint_path(args, epoch, optimized=optimized)
 
@@ -1127,6 +1162,8 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
     scheduler = None
     last_epoch = 0
     loss_log = {'train': {}, 'valid': {}}
+
+    explicit_checkpoint = str(getattr(args, 'checkpoint_path', '') or '').strip()
 
     if args.mode == 'rl' and args.rl_resume_epoch != 0:
         resume_path = get_resume_checkpoint_path(args, args.rl_resume_epoch, optimized=True)
@@ -1139,7 +1176,7 @@ def load_model_by_mode(args, device, model_name, ntoken, config_train, special_t
         )
         model.model_name = model_name
         model.to(device)
-    elif args.resume_epoch != 0:
+    elif args.resume_epoch != 0 or explicit_checkpoint:
         resume_path = get_resume_checkpoint_path(args, args.resume_epoch, optimized=False)
         print(f'Loading model: {resume_path}')
         base_model = None

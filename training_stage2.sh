@@ -9,8 +9,8 @@ python training.py \
   --override_nepoch 3 \
   --max_train_rows 0 \
   --max_valid_rows 0 \
-  --max_train_batches 0 \
-  --max_valid_batches 0 \
+  --max_train_batches 50000 \
+  --max_valid_batches 2000 \
   --result_top_k 3 \
   --accelerate \
   --mixed_precision "fp16" \
@@ -19,7 +19,7 @@ python training.py \
   --dataloader_num_workers 4 \
   --dataloader_pin_memory true \
   --dataloader_persistent_workers true \
-  --train_log_every 10 \
+  --train_log_every 100 \
   --save_frequency 1 \
   --use_peft \
   --lora_r 8 \
@@ -28,4 +28,4 @@ python training.py \
   --disable_text_extra_tokens \
   --override_lr 1e-4 \
   --override_warm_up 100 \
-  --intra_epoch_comparison_every 5000
+  --intra_epoch_comparison_every 2000

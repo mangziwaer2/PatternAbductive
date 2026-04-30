@@ -1,7 +1,7 @@
 python training.py \
   --batch_size 1 \
   --checkpoint-path "/kaggle/input/models/mangziwaer2/qwenabductivestage1/pytorch/default/1/Qwen2.5-0.5B/" \
-  --data_root "/kaggle/input/datasets/mangziwaer2/abductive-sampled/sampled_data_abduction" \
+  --data_root "/root/autodl-tmp/sampled_data_abduction"  \
   --modelname "Qwen2.5-0.5B" \
   --train_stage stage2 \
   --mode rl \
