@@ -1432,7 +1432,10 @@ def save_model(path, contents, model, optimizer=None, scheduler=None, epoch=None
             adapter_dir = f'{path}.adapter'
             if os.path.exists(adapter_dir):
                 shutil.rmtree(adapter_dir)
-            model.save_pretrained(adapter_dir)
+            try:
+                model.save_pretrained(adapter_dir, save_embedding_layers=False)
+            except TypeError:
+                model.save_pretrained(adapter_dir)
             checkpoint = {
                 'peft_checkpoint': True,
                 'peft_adapter_dir': os.path.basename(adapter_dir),

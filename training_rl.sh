@@ -1,6 +1,6 @@
 python training.py \
   --batch_size 1 \
-  --checkpoint-path "/kaggle/input/models/mangziwaer2/qwenabductivestage1/pytorch/default/1/Qwen2.5-0.5B/" \
+  --checkpoint-path latest \
   --data_root "/root/autodl-tmp/sampled_data_abduction"  \
   --modelname "Qwen2.5-0.5B" \
   --train_stage stage2 \
@@ -19,7 +19,7 @@ python training.py \
   --disable_text_extra_tokens \
   --rl_lr 1e-6 \
   --rl_epochs 1 \
-  --rl_max_steps 10000 \
+  --rl_max_steps 50 \
   --rl_max_action_steps 6 \
   --rl_max_completion_length 128 \
   --rl_logging_steps 10 \
