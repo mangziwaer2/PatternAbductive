@@ -1,4 +1,4 @@
-from utils.kg_actions import execute_action_text, parse_action_text
+from utils.kg_actions import execute_action, execute_action_text, parse_action_text, render_action
 from utils.logic_dsl import (
     DSL_END_TAG,
     DSL_START_TAG,
@@ -63,12 +63,20 @@ def run_action_tool_call(
         observation_text: str,
         action_text: str,
         kg,
-        graph_split: str = 'train') -> dict:
+        graph_split: str = 'train',
+        override_top_k: int | None = None) -> dict:
     if not is_complete_action_text(action_text):
         raise ValueError(f'Incomplete action text: {action_text}')
 
     action = parse_action_text(action_text)
-    result_text = execute_action_text(action_text, kg=kg, graph_split=graph_split)
+    if override_top_k is not None and int(override_top_k) > 0:
+        action['top_k'] = int(override_top_k)
+        action_text = render_action(action)
+        evidence = execute_action(action, kg=kg, graph_split=graph_split)
+        from utils.evidence import render_evidence_package
+        result_text = render_evidence_package(evidence, kg, prefix='RESULT')
+    else:
+        result_text = execute_action_text(action_text, kg=kg, graph_split=graph_split)
     return {
         'action': action,
         'action_text': action_text,

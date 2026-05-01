@@ -706,6 +706,7 @@ def rollout_once(model, tokenizer, kg, record, device, args):
                     action_text=action_text,
                     kg=kg,
                     graph_split=args.rl_search_split,
+                    override_top_k=args.result_top_k,
                 )
             except Exception as exc:
                 history.append(action_text)

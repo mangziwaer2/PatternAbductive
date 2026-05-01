@@ -7,8 +7,8 @@ python training.py \
   --mode rl \
   --resume_epoch 3 \
   --max_train_rows 0 \
-  --result_top_k 3 \
-  --experiment_name stage3-rl-smoke \
+  --result_top_k 5 \
+  --experiment_name stage3-rl \
   --dataset_num_proc 4 \
   --dataloader_num_workers 0 \
   --dataloader_pin_memory true \
