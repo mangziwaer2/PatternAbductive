@@ -6,7 +6,9 @@ from utils.action_supervision import (
     VALID_ACTION_TYPES,
 )
 from utils.evidence import (
+    build_alternative_evidence,
     build_common_cause_evidence,
+    build_exclusion_evidence,
     build_expand_evidence,
     render_evidence_package,
 )
@@ -75,35 +77,27 @@ def execute_action(action: dict, kg, graph_split: str = 'train') -> dict:
     if action_type in {'FIND_COMMON', 'FIND_ALTERNATIVE', 'FIND_EXCLUSION'}:
         targets = action.get('targets') or []
         observation_text = 'OBS ' + ' '.join(targets)
-        # Fetch extra candidates for alternative/exclusion actions, then let
-        # rendering keep the requested top_k after action-specific ordering.
-        evidence = build_common_cause_evidence(
+        if action_type == 'FIND_ALTERNATIVE':
+            return build_alternative_evidence(
+                target_text=observation_text,
+                kg=kg,
+                graph_split=graph_split,
+                top_k=top_k,
+            )
+        if action_type == 'FIND_EXCLUSION':
+            return build_exclusion_evidence(
+                target_text=observation_text,
+                kg=kg,
+                graph_split=graph_split,
+                top_k=top_k,
+            )
+        return build_common_cause_evidence(
             observation_text=observation_text,
             kg=kg,
             graph_split=graph_split,
-            top_k=top_k * 3 if action_type != 'FIND_COMMON' else top_k,
+            top_k=top_k,
             max_hops=1,
         )
-        if action_type == 'FIND_ALTERNATIVE':
-            evidence['mode'] = 'find_alternative'
-            evidence['candidates'] = sorted(
-                evidence.get('candidates', []),
-                key=lambda item: (-item.get('coverage_num', 0), item.get('entity_id', 0)),
-            )[:top_k]
-        elif action_type == 'FIND_EXCLUSION':
-            evidence['mode'] = 'find_exclusion'
-            evidence['candidates'] = sorted(
-                evidence.get('candidates', []),
-                key=lambda item: (
-                    len(item.get('missing_ids', [])) == 0,
-                    -item.get('coverage_num', 0),
-                    len(item.get('missing_ids', [])),
-                    item.get('entity_id', 0),
-                ),
-            )[:top_k]
-        else:
-            evidence['mode'] = 'find_common'
-        return evidence
 
     if action_type == 'EXPAND':
         targets = action.get('targets') or []

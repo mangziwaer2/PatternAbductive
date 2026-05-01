@@ -1,2 +1,30 @@
 lora r提升至16，alpha提升至32，提高对模型的改变能力
 读取权重文件 --checkpoint-path
+重新采样数据集，把ACTION做完整
+
+find common 找共有入边
+find exclusion 找每个实体的入边实体，
+      例如输入a
+      会得到b->a，这是正向关系,
+      同时还有b,c,d->a多个入边
+      取补集再采样k个
+      m,n->a代表mn没有指向a的关系
+      最后如果填入DSL则是NOT(Proj,r,(m))即m不会有关系映射到a
+find alternative 找每个实体的入边实体，
+      例如输入j,k
+      有a,b,c->j
+        d,e->k
+      随机采样入边实体得到
+      a,b,e
+      abe再找出边
+      a->j,l,o
+      b->j,t,y
+      e->k,p
+      再随机采样几个
+      则变为
+      a->l,j
+      b->y
+      e->p
+      这样就达到了补充子图的作用
+
+数据集要重做

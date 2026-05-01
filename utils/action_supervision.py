@@ -27,6 +27,7 @@ ACTION_ALIASES = {
 }
 ACTION_START_TAG = '<ACTION>'
 ACTION_END_TAG = '</ACTION>'
+ACTION_SCHEMA_VERSION = 'actionv8_contrast_altgrounding'
 
 
 def extract_observation_entity_tokens(observation_text: str) -> list[str]:

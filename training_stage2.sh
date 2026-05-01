@@ -1,5 +1,5 @@
 python training.py \
-  --batch_size 2 \
+  --batch_size 1 \
   --checkpoint-path "/root/autodl-tmp/Qwen2.5-0.5B" \
   --data_root "/root/autodl-tmp/sampled_data_abduction" \
   --modelname "Qwen2.5-0.5B" \

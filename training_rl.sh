@@ -19,8 +19,8 @@ python training.py \
   --disable_text_extra_tokens \
   --rl_lr 1e-6 \
   --rl_epochs 1 \
-  --rl_max_steps 50 \
+  --rl_max_steps 50000 \
   --rl_max_action_steps 6 \
   --rl_max_completion_length 128 \
-  --rl_logging_steps 10 \
-  --rl_save_steps 100
+  --rl_logging_steps 100 \
+  --rl_save_steps 1000

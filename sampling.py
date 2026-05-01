@@ -36,9 +36,11 @@ def judge(answers_from, mode):
     return False
 
 
-def sample_good_query_given_pattern(mode, max_answers_size, pattern_str):
+def sample_good_query_given_pattern(mode, max_answers_size, max_attempts, pattern_str):
     answers_from = {}
-    while True:
+    attempts = 0
+    while max_attempts <= 0 or attempts < max_attempts:
+        attempts += 1
         sampled_query = graph_samplers[mode].sample_valid_query_given_pattern(pattern_str)
 
         answers_from['train'] = graph_samplers['train'].search_answers_to_query(sampled_query)
@@ -53,6 +55,8 @@ def sample_good_query_given_pattern(mode, max_answers_size, pattern_str):
 
         if judge(answers_from, mode):
             break
+    else:
+        return None, None, pattern_str
 
     return sampled_query, answers_from, pattern_str
 
@@ -259,18 +263,19 @@ def sample_mode(args, mode, graph_samplers, patterns_pool, rng, kg, state):
     try:
         for base_sample_id in progress:
             pattern_str = patterns_pool[mode][base_sample_id]
-            func = partial(sample_good_query_given_pattern, mode, args.max_answer_size)
+            func = partial(sample_good_query_given_pattern, mode, args.max_answer_size, args.max_query_attempts)
             sampled_query, answers_from, query_type = func(pattern_str)
-            records_buffer.extend(build_sample_records(
-                args=args,
-                mode=mode,
-                answers_from=answers_from,
-                query=sampled_query,
-                pattern_str=query_type,
-                base_sample_id=base_sample_id,
-                rng=rng,
-                kg=kg,
-            ))
+            if sampled_query is not None:
+                records_buffer.extend(build_sample_records(
+                    args=args,
+                    mode=mode,
+                    answers_from=answers_from,
+                    query=sampled_query,
+                    pattern_str=query_type,
+                    base_sample_id=base_sample_id,
+                    rng=rng,
+                    kg=kg,
+                ))
             next_index = base_sample_id + 1
             if len(records_buffer) >= args.flush_size:
                 rows_written += flush_records(records_buffer, output_path, rng)
@@ -345,6 +350,12 @@ def my_parse_args():
     parser.add_argument('--flush-size', type=int, default=5000)
     parser.add_argument('--checkpoint-frequency', type=int, default=1000)
     parser.add_argument('--result-top-k', type=int, default=3)
+    parser.add_argument(
+        '--max-query-attempts',
+        type=int,
+        default=300,
+        help='Maximum attempts to instantiate one pattern before skipping it. Use <=0 for unlimited.',
+    )
     parser.add_argument('--splits', default='train,valid,test')
     parser.add_argument('--restart', action='store_true')
     parser.add_argument(
@@ -357,6 +368,7 @@ def my_parse_args():
 
 def main():
     args = my_parse_args()
+    random.seed(args.seed)
     args.exclude_condition_types = normalize_condition_type_list(args.exclude_condition_types)
     pattern_table = pd.read_csv(args.pattern_path, index_col='id')
     print(pattern_table)

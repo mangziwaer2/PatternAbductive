@@ -1,5 +1,5 @@
 from tqdm import tqdm
-from random import sample, choice, randint
+from random import sample, randint, shuffle
 
 #用于在networkx图中进行采样
 class GraphSampler:
@@ -9,6 +9,7 @@ class GraphSampler:
         self.dense_nodes = list(self.graph.nodes)
         self.id2rel = id2rel
         self.out_degree_data = self.preprocess_out_degree_by_key()
+        self.max_branch_resample_attempts = 16
 
     def in_degree(self, nodes):
         return self.graph.in_degree(nodes)
@@ -152,17 +153,20 @@ class GraphSampler:
             if self.in_degree(tail_node) == 0:
                 return None, None, None
 
-            head_node, _, relation = choice(list(self.in_edges(tail_node)))
+            incoming_edges = list(self.in_edges(tail_node))
+            shuffle(incoming_edges)
+            for head_node, _, relation in incoming_edges:
+                sub_query, _, prev_relation = self.recur_sample_query_given_pattern_answer(sub_pattern[1], head_node)
+                if sub_query is None:
+                    continue
+                if self.is_reverse_edge(prev_relation, relation):
+                    continue
 
-            sub_query, _, prev_relation = self.recur_sample_query_given_pattern_answer(sub_pattern[1], head_node)
-            if sub_query is None:
-                return None, None, None
-            if self.is_reverse_edge(prev_relation, relation):
-                return None, None, None
+                # return f'(p,({relation}),{sub_query})', head_node, relation
+                # represent relation as negative number
+                return ['(', 'p', '(', -relation, ')', *sub_query, ')'], head_node, relation
 
-            # return f'(p,({relation}),{sub_query})', head_node, relation
-            # represent relation as negative number
-            return ['(', 'p', '(', -relation, ')', *sub_query, ')'], head_node, relation
+            return None, None, None
 
         elif operator == "n":
             """If we use the negation here, it is possible that we generate a query that do not have an answer.
@@ -188,11 +192,18 @@ class GraphSampler:
 
             sub_queries_list = []
             from_node_list = []
+            max_branch_resample_attempts = getattr(self, 'max_branch_resample_attempts', 16)
 
             for pattern in sub_pattern[1:]:
-                sub_q, head_node, relation = self.recur_sample_query_given_pattern_answer(pattern, tail_node)
+                sub_q, head_node, relation = None, None, None
+                for _ in range(max_branch_resample_attempts):
+                    candidate_q, candidate_head, candidate_relation = self.recur_sample_query_given_pattern_answer(pattern, tail_node)
+                    if (candidate_q is None) or (candidate_q in sub_queries_list) or (candidate_head in from_node_list):
+                        continue
+                    sub_q, head_node, relation = candidate_q, candidate_head, candidate_relation
+                    break
 
-                if (sub_q is None) or (sub_q in sub_queries_list) or (head_node in from_node_list):
+                if sub_q is None:
                     return None, None, None
                 # print(f'{head_node}({sub_q}) -> {tail_node}')
                 sub_queries_list.append(sub_q)

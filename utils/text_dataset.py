@@ -1,5 +1,6 @@
 from utils.action_supervision import (
     extract_observation_entity_tokens,
+    ACTION_SCHEMA_VERSION,
     infer_branch_hops,
     infer_action_steps,
     infer_action_type,
@@ -59,6 +60,7 @@ def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
         if not result_has_edges(result):
             return []
         trace.append({
+            'schema': ACTION_SCHEMA_VERSION,
             'action': action,
             'result': result,
         })
@@ -77,6 +79,7 @@ def build_stage2_trace(pattern_str, observation_text, kg, graph_split, top_k):
         if not result_has_edges(result):
             break
         trace.append({
+            'schema': ACTION_SCHEMA_VERSION,
             'action': action,
             'result': result,
         })

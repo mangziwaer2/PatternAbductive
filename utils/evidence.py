@@ -1,4 +1,5 @@
 from collections import defaultdict
+import random
 
 from utils.textualization import (
     entity_id_to_text,
@@ -85,6 +86,25 @@ def _dedupe_edges(edges: list[dict]) -> list[dict]:
     return deduped
 
 
+def _sample_items(items: list, k: int) -> list:
+    if k <= 0:
+        return []
+    if len(items) <= k:
+        return list(items)
+    return random.sample(list(items), k)
+
+
+def _candidate_from_edge(edge: dict, coverage_den: int = 1) -> dict:
+    return {
+        'entity_id': int(edge['subject_id']),
+        'support': [edge],
+        'missing_ids': [],
+        'coverage_num': 1,
+        'coverage_den': max(int(coverage_den), 1),
+        'score': 1.0 / max(int(coverage_den), 1),
+    }
+
+
 def build_common_cause_evidence(
         observation_text: str,
         kg,
@@ -121,19 +141,124 @@ def build_common_cause_evidence(
         coverage_den = max(len(observation_ids), 1)
         candidates.append({
             'entity_id': candidate_id,
-            'support': supports[:max_supports_per_candidate],
+            'support': _sample_items(supports, max_supports_per_candidate),
             'missing_ids': missing_ids,
             'coverage_num': coverage_num,
             'coverage_den': coverage_den,
             'score': coverage_num / coverage_den,
         })
 
-    candidates.sort(key=lambda item: (-item['coverage_num'], len(item['missing_ids']), item['entity_id']))
+    if len(observation_ids) > 1:
+        multi_target_candidates = [
+            candidate for candidate in candidates if candidate['coverage_num'] > 1
+        ]
+        if multi_target_candidates:
+            candidates = multi_target_candidates
     return {
         'mode': 'common_cause',
         'graph_split': graph_split,
         'observation_ids': observation_ids,
-        'candidates': candidates[:top_k],
+        'candidates': _sample_items(candidates, top_k),
+    }
+
+
+def _incoming_source_edges(target_ids: list[int], sampler) -> list[dict]:
+    target_id_set = set(int(target_id) for target_id in target_ids)
+    edges = []
+    for target_index, target_id in enumerate(target_ids):
+        for source_id, object_id, relation_id in sampler.in_edges(int(target_id)):
+            edge = {
+                'subject_id': int(source_id),
+                'relation_id': int(relation_id),
+                'object_id': int(object_id),
+                'observation_index': target_index,
+            }
+            if _is_self_loop(edge):
+                continue
+            if int(edge['subject_id']) in target_id_set:
+                continue
+            edges.append(edge)
+    return _dedupe_edges(edges)
+
+
+def build_alternative_evidence(
+        target_text: str,
+        kg,
+        graph_split: str = 'train',
+        top_k: int = 10):
+    target_ids = observation_text_to_answer_ids(target_text, kg)
+    sampler = _resolve_graph_sampler(kg, graph_split)
+    incoming_edges = _incoming_source_edges(target_ids, sampler)
+    source_ids = _sample_items(sorted({edge['subject_id'] for edge in incoming_edges}), top_k)
+    outgoing_edges = []
+
+    for source_id in source_ids:
+        for subject_id, object_id, relation_id in sampler.out_edges(int(source_id)):
+            edge = {
+                'subject_id': int(subject_id),
+                'relation_id': int(relation_id),
+                'object_id': int(object_id),
+            }
+            if _is_self_loop(edge):
+                continue
+            outgoing_edges.append(edge)
+
+    sampled_edges = _sample_items(_dedupe_edges(outgoing_edges), top_k)
+    return {
+        'mode': 'find_alternative',
+        'graph_split': graph_split,
+        'observation_ids': target_ids,
+        'candidates': [_candidate_from_edge(edge) for edge in sampled_edges],
+    }
+
+
+def build_exclusion_evidence(
+        target_text: str,
+        kg,
+        graph_split: str = 'train',
+        top_k: int = 10):
+    target_ids = observation_text_to_answer_ids(target_text, kg)
+    target_id_set = set(int(target_id) for target_id in target_ids)
+    sampler = _resolve_graph_sampler(kg, graph_split)
+    incoming_edges = _incoming_source_edges(target_ids, sampler)
+    relation_ids = sorted({edge['relation_id'] for edge in incoming_edges})
+
+    contrast_edges = []
+    for relation_id in relation_ids:
+        edges_for_relation = []
+        objects_by_source = defaultdict(set)
+        for subject_id, object_id, edge_relation_id in sampler.graph.edges(keys=True):
+            if int(edge_relation_id) != int(relation_id):
+                continue
+            subject_id = int(subject_id)
+            object_id = int(object_id)
+            objects_by_source[subject_id].add(object_id)
+            edges_for_relation.append({
+                'subject_id': subject_id,
+                'relation_id': int(edge_relation_id),
+                'object_id': object_id,
+            })
+
+        excluded_sources = {
+            source_id
+            for source_id, object_ids in objects_by_source.items()
+            if object_ids & target_id_set
+        }
+        for edge in edges_for_relation:
+            if _is_self_loop(edge):
+                continue
+            if int(edge['subject_id']) in excluded_sources:
+                continue
+            if int(edge['object_id']) in target_id_set:
+                continue
+            contrast_edges.append(edge)
+
+    sampled_edges = _sample_items(_dedupe_edges(contrast_edges), top_k)
+    return {
+        'mode': 'find_exclusion',
+        'graph_split': graph_split,
+        'observation_ids': target_ids,
+        'candidates': [_candidate_from_edge(edge) for edge in sampled_edges],
     }
 
 
@@ -193,7 +318,7 @@ def build_expand_evidence(
         coverage_den = max(len(target_ids), 1)
         candidates.append({
             'entity_id': candidate_id,
-            'support': supports[:max_supports_per_candidate],
+            'support': _sample_items(supports, max_supports_per_candidate),
             'missing_ids': missing_ids,
             'coverage_num': coverage_num,
             'coverage_den': coverage_den,
@@ -201,13 +326,12 @@ def build_expand_evidence(
             'score': coverage_num / coverage_den,
         })
 
-    candidates.sort(key=lambda item: (-item['coverage_num'], len(item['missing_ids']), item['entity_id']))
     return {
         'mode': 'expand',
         'direction': direction,
         'graph_split': graph_split,
         'observation_ids': target_ids,
-        'candidates': candidates[:top_k],
+        'candidates': _sample_items(candidates, top_k),
     }
 
 

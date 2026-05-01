@@ -11,12 +11,16 @@ from utils.load import (
 from utils.logic_dsl import pattern_str_to_pattern_dsl, surface_query_to_dsl, tag_dsl_text
 from utils.evidence import RESULT_END_TAG, RESULT_START_TAG
 from utils.text_dataset import build_stage2_trace, result_has_edges
-from utils.action_supervision import ACTION_END_TAG, ACTION_START_TAG, strip_action_tags
+from utils.action_supervision import (
+    ACTION_END_TAG,
+    ACTION_SCHEMA_VERSION,
+    ACTION_START_TAG,
+    strip_action_tags,
+)
 
 
 REPRESENTATION_TEXT = 'text'
 DEFAULT_TRAIN_STAGE = 'logic'
-ACTION_SCHEMA_VERSION = 'actionv6_compact_tags'
 CURRENT_ACTION_PREFIXES = (
     'ACTION FIND_COMMON ',
     'ACTION FIND_ALTERNATIVE ',
@@ -135,6 +139,8 @@ def trace_uses_current_action_schema(trace) -> bool:
         return False
     action_count = 0
     for event in normalized:
+        if event.get('schema') != ACTION_SCHEMA_VERSION:
+            return False
         action = str(event.get('action', '')).strip()
         if not action:
             continue
