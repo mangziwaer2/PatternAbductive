@@ -7,8 +7,8 @@ find exclusion 找每个实体的入边实体，
       例如输入a
       会得到b->a，这是正向关系,
       同时还有b,c,d->a多个入边
-      取补集再采样k个
-      m,n->a代表mn没有指向a的关系
+      取入边实体的补集再采样k个
+      例如m,n->a代表mn没有指向a的关系
       最后如果填入DSL则是NOT(Proj,r,(m))即m不会有关系映射到a
 find alternative 找每个实体的入边实体，
       例如输入j,k

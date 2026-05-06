@@ -925,6 +925,33 @@ def optimize_rollout_policy(args, dataset, model, tokenizer, graph_samplers, kg,
                 for generation in rollout.get('raw_generations', [])
             ],
         }
+        for key in [
+                'logic_stage3_reward',
+                'action_reward_avg',
+                'action_valid',
+                'strict_action_parse_rate',
+                'malformed_action_rate',
+                'trace_dsl_consistency',
+                'not_consistency',
+                'or_consistency',
+                'expand_consistency',
+                'evidence_usage',
+                'evidence_usage_reward',
+                'hallucinated_dsl_token_rate',
+                'unknown_action_entity_count',
+                'unknown_dsl_entity_count',
+                'tag_role_mismatch',
+                'repeated_close_tag_count',
+                'malformed_action_text_count',
+                'repeat_action_count',
+                'action_execution_error_count',
+                'bad_generation_penalty_total',
+                'no_action_penalty',
+                'step_control',
+                'action_type_sequence',
+        ]:
+            if key in score:
+                row[key] = score[key]
         with open(log_path, 'a', encoding='utf-8') as log_file:
             log_file.write(json.dumps(row, ensure_ascii=False) + '\n')
 
@@ -1466,7 +1493,7 @@ def save_model(path, contents, model, optimizer=None, scheduler=None, epoch=None
 def my_parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--modelname', default='GPT2_6_act_nt')
+    parser.add_argument('--modelname', default='Qwen2.5-0.5B')
     parser.add_argument('--config-model', default='configs/config-model.yml')
     parser.add_argument('--config-dataloader', default='configs/config-dataloader.yml')
     parser.add_argument('--config-train', default='configs/config-train.yml')
@@ -1482,7 +1509,7 @@ def my_parse_args():
     parser.add_argument(
         '--checkpoint-path',
         dest='checkpoint_path',
-        default='',
+        default='E:\project\LLM\PatternAbductive\ckpt\Qwen2.5-0.5B\DBpedia50-default-8-11000-rl-text2text.pth',
         help='Explicit checkpoint path for loading/resuming. Saving still uses --checkpoint_root.',
     )
     parser.add_argument('-r', '--resume_epoch', type=int, default=0)
@@ -1508,7 +1535,7 @@ def my_parse_args():
         help='Comma-separated extra trainable modules to save with LoRA. Use auto/none.',
     )
 
-    parser.add_argument('--mode', default='training', choices=['training', 'rl'])
+    parser.add_argument('--mode', default='rl', choices=['training', 'rl'])
     parser.add_argument('--accelerate', action='store_true')
     parser.add_argument('--mixed_precision', default='no', choices=['no', 'fp16', 'bf16'])
 
@@ -1546,7 +1573,7 @@ def my_parse_args():
     parser.add_argument('--force_load_kg', action='store_true')
     parser.add_argument(
         '--train_stage',
-        default='logic',
+        default='stage2',
         choices=['logic', 'stage2'],
     )
     parser.add_argument('--result_top_k', type=int, default=3)

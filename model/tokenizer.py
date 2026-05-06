@@ -135,6 +135,8 @@ def extract_text_sample_to_device(
         merged_source,
         target_with_eos,
         padding='longest',
+        truncation=True,
+        max_length=int(src_len) + int(tgt_len),
         return_tensors='pt',
     ).to(device)
     labels = torch.clone(source_target_tokenized.input_ids)
@@ -142,6 +144,7 @@ def extract_text_sample_to_device(
     source_tokenized = tokenizer(
         merged_source,
         padding='max_length',
+        truncation=True,
         max_length=labels.shape[-1],
         return_tensors='pt',
     ).to(device)
@@ -156,6 +159,7 @@ def extract_text_sample_to_device(
         source_tokenized = tokenizer(
             merged_source,
             padding='longest',
+            truncation=True,
             max_length=src_len,
             return_tensors='pt',
         ).to(device)
